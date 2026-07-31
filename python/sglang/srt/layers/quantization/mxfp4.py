@@ -532,6 +532,23 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer):
+        proxy_owner = getattr(layer, "_oil_proxy_bank_owner", None)
+        if proxy_owner is not None:
+            # The owner appears earlier in K3's module traversal and has
+            # already been transformed for the selected kernel backend.
+            # Rebind now so an alias is never transformed a second time.
+            layer.bind_expert_storage_from(proxy_owner)
+            owner_method = proxy_owner.quant_method
+            for name in (
+                "w13_precision_config",
+                "w2_precision_config",
+                "w13_weight_triton_tensor",
+                "w2_weight_triton_tensor",
+            ):
+                if hasattr(owner_method, name):
+                    setattr(self, name, getattr(owner_method, name))
+            return
+
         if self.use_marlin:
             from sglang.srt.layers.quantization.marlin_utils import (
                 check_moe_marlin_supports_layer,

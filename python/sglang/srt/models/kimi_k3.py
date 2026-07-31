@@ -374,6 +374,7 @@ class KimiK3MoE(nn.Module):
         prefix: str = "",
         layer_idx: int = 0,
         alt_stream: Optional[torch.cuda.Stream] = None,
+        proxy_expert_banks: Optional[dict[int, nn.Module]] = None,
     ):
         super().__init__()
         hidden_size = config.hidden_size
@@ -434,6 +435,24 @@ class KimiK3MoE(nn.Module):
             ),
             prefix=add_prefix("experts", prefix),
         )
+
+        proxy_layer_to_bank = getattr(config, "oil_proxy_layer_to_bank", None)
+        if proxy_layer_to_bank is not None:
+            if proxy_expert_banks is None:
+                raise ValueError("K3 proxy expert-bank registry was not initialized")
+            bank_owner = int(proxy_layer_to_bank[self.layer_idx])
+            if bank_owner == self.layer_idx:
+                proxy_expert_banks[bank_owner] = self.experts
+            else:
+                owner = proxy_expert_banks.get(bank_owner)
+                if owner is None:
+                    raise ValueError(
+                        f"K3 proxy expert-bank owner {bank_owner} must be constructed "
+                        f"before logical layer {self.layer_idx}"
+                    )
+                # Avoid registering the owner as a child module of the alias.
+                object.__setattr__(self.experts, "_oil_proxy_bank_owner", owner)
+                self.experts.bind_expert_storage_from(owner)
 
         self.topk = TopK(
             top_k=config.num_experts_per_token,
@@ -1911,6 +1930,7 @@ class KimiK3DecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_streams: Optional[List[torch.cuda.Stream]] = None,
+        proxy_expert_banks: Optional[dict[int, nn.Module]] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -2006,6 +2026,7 @@ class KimiK3DecoderLayer(nn.Module):
                 layer_idx=layer_idx,
                 prefix=f"{prefix}.mlp",
                 alt_stream=alt_streams[0] if alt_streams is not None else None,
+                proxy_expert_banks=proxy_expert_banks,
             )
         else:
             self.mlp = KimiK3MLP(
@@ -2409,6 +2430,7 @@ class KimiK3LinearModel(nn.Module):
         # into the agg1 fast kernel, see AttnResidual.forward(write=True).)
         # Disable on HIP code path.
         self.alt_streams = None if _is_hip else [torch.cuda.Stream() for _ in range(3)]
+        proxy_expert_banks: dict[int, nn.Module] = {}
 
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
@@ -2418,6 +2440,7 @@ class KimiK3LinearModel(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
                 alt_streams=self.alt_streams,
+                proxy_expert_banks=proxy_expert_banks,
             ),
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,

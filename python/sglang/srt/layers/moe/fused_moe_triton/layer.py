@@ -482,6 +482,52 @@ class FusedMoE(torch.nn.Module):
         else:
             setattr(self, name, tensor)
 
+    def bind_expert_storage_from(self, owner: "FusedMoE") -> None:
+        """Alias routed-expert storage from another logical MoE layer.
+
+        This deliberately keeps the FusedMoE module, router, dispatcher, and
+        logical layer id distinct. Only tensors owned by the expert kernel are
+        shared. It is used by compact systems-proxy checkpoints whose config
+        declares a physical expert-bank owner for each logical layer.
+        """
+        tensor_names = {
+            name
+            for name, value in owner._parameters.items()
+            if value is not None and name.startswith(("w13_", "w2_"))
+        }
+        tensor_names.update(
+            name
+            for name, value in owner._buffers.items()
+            if value is not None and name.startswith(("w13_", "w2_"))
+        )
+        tensor_names.update(
+            name
+            for name, value in vars(owner).items()
+            if isinstance(value, torch.Tensor)
+            and name.startswith(("w13_", "w2_"))
+        )
+        own_tensor_names = {
+            name
+            for name in (*self._parameters, *self._buffers, *vars(self))
+            if name.startswith(("w13_", "w2_")) and hasattr(self, name)
+        }
+        for name in own_tensor_names - tensor_names:
+            delattr(self, name)
+        for name in sorted(tensor_names):
+            value = getattr(owner, name)
+            self.replace_expert_tensor(
+                name, value.data if isinstance(value, torch.nn.Parameter) else value
+            )
+
+        # Some post-load backends attach derived expert layouts under their
+        # own names rather than replacing w13/w2 directly.
+        for name in ("mega_l1_weights", "mega_l2_weights"):
+            if hasattr(owner, name):
+                setattr(self, name, getattr(owner, name))
+        for name in ("_mxfp4_backend", "_mega_moe_weights_built", "is_shuffled"):
+            if hasattr(owner, name):
+                setattr(self, name, getattr(owner, name))
+
     @cached_property
     def use_padded_loading(self) -> bool:
         # This handles the case where the loaded weights are smaller than the padded expert_data
