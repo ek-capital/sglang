@@ -78,6 +78,60 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _parallel_identity() -> tuple[int, int, int, int]:
+    """Resolve ranks after SGLang has initialized torch.distributed.
+
+    SGLang's multiprocessing launcher passes ranks as function arguments rather
+    than exporting RANK/LOCAL_RANK in every scheduler worker.  Environment-only
+    discovery therefore makes every TP worker look like rank zero and causes
+    capture-file collisions.  Explicit capture overrides remain useful for
+    tests and non-standard launchers; otherwise prefer live process-group state.
+    """
+    explicit_rank = os.environ.get("SGLANG_K3_CAPTURE_RANK")
+    explicit_local_rank = os.environ.get("SGLANG_K3_CAPTURE_LOCAL_RANK")
+    explicit_tp_rank = os.environ.get("SGLANG_K3_CAPTURE_TP_RANK")
+    explicit_world_size = os.environ.get("SGLANG_K3_CAPTURE_WORLD_SIZE")
+
+    dist_ready = torch.distributed.is_available() and torch.distributed.is_initialized()
+    rank = (
+        int(explicit_rank)
+        if explicit_rank is not None
+        else torch.distributed.get_rank()
+        if dist_ready
+        else int(os.environ.get("RANK", "0"))
+    )
+    world_size = (
+        int(explicit_world_size)
+        if explicit_world_size is not None
+        else torch.distributed.get_world_size()
+        if dist_ready
+        else int(os.environ.get("WORLD_SIZE", "1"))
+    )
+    local_rank = (
+        int(explicit_local_rank)
+        if explicit_local_rank is not None
+        else int(os.environ["LOCAL_RANK"])
+        if "LOCAL_RANK" in os.environ
+        else torch.cuda.current_device()
+        if torch.cuda.is_available()
+        else rank
+    )
+
+    if explicit_tp_rank is not None:
+        tp_rank = int(explicit_tp_rank)
+    else:
+        try:
+            from sglang.srt.distributed.parallel_state import (
+                get_tensor_model_parallel_rank,
+            )
+
+            tp_rank = get_tensor_model_parallel_rank()
+        except (AssertionError, ImportError, RuntimeError):
+            tp_rank = int(os.environ.get("TP_RANK", str(rank)))
+
+    return rank, local_rank, tp_rank, world_size
+
+
 class K3TensorCapture:
     def __init__(self) -> None:
         capture_dir = os.environ.get("SGLANG_K3_CAPTURE_DIR", "").strip()
@@ -85,9 +139,9 @@ class K3TensorCapture:
         self.root = Path(capture_dir) if capture_dir else None
         arm_file = os.environ.get("SGLANG_K3_CAPTURE_ARM_FILE", "").strip()
         self.arm_file = Path(arm_file) if arm_file else None
-        self.rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
-        self.local_rank = int(os.environ.get("LOCAL_RANK", str(self.rank)))
-        self.tp_rank = int(os.environ.get("TP_RANK", str(self.rank)))
+        self.rank, self.local_rank, self.tp_rank, self.world_size = (
+            _parallel_identity()
+        )
         self.default_max_rows = max(
             1, int(os.environ.get("SGLANG_K3_CAPTURE_MAX_ROWS", "512"))
         )
@@ -120,7 +174,7 @@ class K3TensorCapture:
                 "rank": self.rank,
                 "local_rank": self.local_rank,
                 "tp_rank": self.tp_rank,
-                "world_size": int(os.environ.get("WORLD_SIZE", "1")),
+                "world_size": self.world_size,
                 "run_id": os.environ.get("SGLANG_K3_CAPTURE_RUN_ID"),
                 "model_revision": os.environ.get("SGLANG_K3_CAPTURE_MODEL_REVISION"),
                 "sglang_revision": os.environ.get("SGLANG_K3_CAPTURE_SGLANG_REVISION"),

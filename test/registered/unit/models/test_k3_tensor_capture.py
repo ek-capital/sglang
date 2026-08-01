@@ -84,3 +84,25 @@ def test_k3_tensor_capture_waits_for_arm_file(tmp_path, monkeypatch):
     arm_file.touch()
     assert capture.wants("layer_input", 0)
     assert capture.capture("layer_input", 0, {"x": torch.ones(1)}) is not None
+
+
+def test_k3_tensor_capture_uses_live_distributed_rank(tmp_path, monkeypatch):
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_DIR", str(tmp_path))
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_RANKS", "3")
+    monkeypatch.delenv("RANK", raising=False)
+    monkeypatch.delenv("LOCAL_RANK", raising=False)
+    monkeypatch.delenv("TP_RANK", raising=False)
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 3)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 8)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    capture = K3TensorCapture()
+
+    assert capture.rank == 3
+    assert capture.local_rank == 3
+    assert capture.tp_rank == 3
+    assert capture.world_size == 8
+    assert capture.rank_allowed
+    assert (tmp_path / "rank-00003" / "manifest.jsonl").is_file()
