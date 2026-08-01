@@ -1023,6 +1023,17 @@ class KimiK3MoE(nn.Module):
                     "topk_weights": topk_output.topk_weights,
                 },
             )
+        # Some fused MoE backends treat the TopK output as disposable workspace
+        # and may rewrite its ids while dispatching.  Routing capture runs before
+        # the backend, but expert-output capture runs after it; retain the small
+        # routing tensors now so quota sampling never observes repurposed ids.
+        capture_expert_output = k3_capture_wants("expert_output", self.layer_idx)
+        capture_topk_ids = (
+            topk_output.topk_ids.clone() if capture_expert_output else None
+        )
+        capture_topk_weights = (
+            topk_output.topk_weights.clone() if capture_expert_output else None
+        )
         expert_output = (
             self._forward_mega_experts(routed_input, topk_output)
             if self._use_mega_moe
@@ -1034,8 +1045,8 @@ class KimiK3MoE(nn.Module):
             {
                 "routed_input": routed_input,
                 "expert_output": expert_output,
-                "topk_ids": topk_output.topk_ids,
-                "topk_weights": topk_output.topk_weights,
+                "topk_ids": capture_topk_ids,
+                "topk_weights": capture_topk_weights,
             },
         )
         latent = self._reduce_latent(expert_output)
