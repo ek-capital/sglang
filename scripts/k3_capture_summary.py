@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 
@@ -24,6 +25,7 @@ def main() -> None:
     parser.add_argument("capture_dir", type=Path)
     parser.add_argument("--expect-layers", type=int, default=93)
     parser.add_argument("--skip-hash", action="store_true")
+    parser.add_argument("--hash-workers", type=int, default=min(8, os.cpu_count() or 1))
     parser.add_argument("--write-complete", action="store_true")
     args = parser.parse_args()
     if args.write_complete and args.skip_hash:
@@ -34,15 +36,10 @@ def main() -> None:
     layers = defaultdict(set)
     files = 0
     validated_shards = []
-    validated_manifests = []
+    manifest_paths = []
     expert_quotas = []
     for manifest in sorted(args.capture_dir.glob("rank-*/manifest.jsonl")):
-        validated_manifests.append(
-            {
-                "file": str(manifest.relative_to(args.capture_dir)),
-                "sha256": sha256_file(manifest),
-            }
-        )
+        manifest_paths.append(manifest)
         for line in manifest.read_text(encoding="utf-8").splitlines():
             record = json.loads(line)
             if record.get("record_type") == "expert_quota":
@@ -52,10 +49,6 @@ def main() -> None:
                 shard = manifest.parent / record["file"]
                 if not shard.is_file():
                     raise SystemExit(f"missing shard: {shard}")
-                if not args.skip_hash:
-                    digest = sha256_file(shard)
-                    if digest != record["sha256"]:
-                        raise SystemExit(f"hash mismatch: {shard}")
                 validated_shards.append(
                     {
                         "file": str(shard.relative_to(args.capture_dir)),
@@ -78,10 +71,6 @@ def main() -> None:
             shard = manifest.parent / record["file"]
             if not shard.is_file():
                 raise SystemExit(f"missing shard: {shard}")
-            if not args.skip_hash:
-                digest = sha256_file(shard)
-                if digest != record["sha256"]:
-                    raise SystemExit(f"hash mismatch: {shard}")
             validated_shards.append(
                 {
                     "file": str(shard.relative_to(args.capture_dir)),
@@ -97,6 +86,52 @@ def main() -> None:
 
     if files == 0:
         raise SystemExit("no capture records found")
+
+    validated_manifests = []
+    if args.skip_hash:
+        validated_manifests = [
+            {
+                "file": str(path.relative_to(args.capture_dir)),
+                "sha256": sha256_file(path),
+            }
+            for path in manifest_paths
+        ]
+    else:
+        shard_jobs = [
+            (args.capture_dir / record["file"], record["sha256"])
+            for record in validated_shards
+        ]
+        jobs = [(path, None) for path in manifest_paths] + shard_jobs
+
+        def validate_hash(job: tuple[Path, str | None]) -> tuple[Path, str]:
+            path, expected = job
+            digest = sha256_file(path)
+            if expected is not None and digest != expected:
+                raise ValueError(f"hash mismatch: {path}")
+            return path, digest
+
+        hashes = {}
+        try:
+            with ThreadPoolExecutor(max_workers=max(1, args.hash_workers)) as pool:
+                for completed, (path, digest) in enumerate(
+                    pool.map(validate_hash, jobs), 1
+                ):
+                    hashes[path] = digest
+                    if completed % 256 == 0 or completed == len(jobs):
+                        print(
+                            f"hashed {completed}/{len(jobs)} files",
+                            flush=True,
+                        )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        validated_manifests = [
+            {
+                "file": str(path.relative_to(args.capture_dir)),
+                "sha256": hashes[path],
+            }
+            for path in manifest_paths
+        ]
+
     print(f"validated {files} shards")
     for point in sorted(rows):
         missing = sorted(set(range(args.expect_layers)) - layers[point])
