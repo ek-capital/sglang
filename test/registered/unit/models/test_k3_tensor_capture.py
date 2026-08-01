@@ -1,6 +1,7 @@
 import hashlib
 import importlib.util
 import json
+from enum import IntEnum
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -154,6 +155,30 @@ def test_phase_quotas_are_independent(tmp_path, monkeypatch):
     assert capture.remaining_rows("layer_input", 0) == 2
     capture.capture("layer_input", 0, {"x": torch.arange(5).view(5, 1)})
     assert capture.remaining_rows("layer_input", 0) == 0
+
+
+def test_numeric_forward_mode_uses_decode_predicate(tmp_path, monkeypatch):
+    class NumericForwardMode(IntEnum):
+        EXTEND = 1
+        DECODE = 2
+
+        def is_decode(self):
+            return self is NumericForwardMode.DECODE
+
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_DIR", str(tmp_path))
+    capture = K3TensorCapture()
+
+    capture.set_forward_context(
+        SimpleNamespace(
+            forward_mode=NumericForwardMode.DECODE,
+            extend_prefix_lens_cpu=None,
+            extend_seq_lens_cpu=None,
+            batch_size=1,
+        )
+    )
+
+    assert capture._context["phase"] == "decode"
+    assert capture._context["forward_mode"] == "decode"
 
 
 def test_async_capture_packs_and_uploads_composite_shard(tmp_path, monkeypatch):

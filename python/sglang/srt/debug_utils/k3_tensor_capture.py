@@ -270,8 +270,15 @@ class K3TensorCapture:
 
     def set_forward_context(self, forward_batch: Any) -> None:
         """Attach phase/cache strata to all capture points in this forward."""
-        mode = str(getattr(forward_batch, "forward_mode", "unknown")).lower()
-        phase = "decode" if "decode" in mode else "prefill"
+        forward_mode = getattr(forward_batch, "forward_mode", "unknown")
+        mode_name = getattr(forward_mode, "name", None)
+        mode = str(mode_name if mode_name is not None else forward_mode).lower()
+        is_decode = getattr(forward_mode, "is_decode", None)
+        phase = (
+            "decode"
+            if (bool(is_decode()) if callable(is_decode) else "decode" in mode)
+            else "prefill"
+        )
         prefix_lens = getattr(forward_batch, "extend_prefix_lens_cpu", None) or []
         seq_lens = getattr(forward_batch, "extend_seq_lens_cpu", None) or []
         max_prefix = max((int(x) for x in prefix_lens), default=0)
