@@ -20,6 +20,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.debug_utils.k3_tensor_capture import k3_capture
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 
@@ -386,6 +387,7 @@ class AttnResidual:
             (num_tokens, block_num, hidden_size)
         )
         self.num_valid_blocks = 0
+        self.capture_layer_idx = -1
         if block_residual is not None:  # inherited from the previous PP rank
             self.num_valid_blocks = block_residual.size(1)
             self.block_residual[:, : self.num_valid_blocks, :].copy_(block_residual)
@@ -459,7 +461,60 @@ class AttnResidual:
             self.num_valid_blocks += 1  # row nvb written in-kernel
         elif write:
             self.write(prefix, rows)
+        self._capture(
+            hidden_states,
+            prefix_sum,
+            block_residual,
+            score_proj,
+            score_norm,
+            out_norm,
+            normed,
+            prefix,
+            nvb,
+            mode="forward",
+            write=write,
+        )
         return normed, prefix
+
+    def _capture(
+        self,
+        hidden_states: torch.Tensor,
+        prefix_sum: Optional[torch.Tensor],
+        bank: torch.Tensor,
+        score_proj: ReplicatedLinear,
+        score_norm: RMSNorm,
+        out_norm: RMSNorm,
+        normed: torch.Tensor,
+        prefix: torch.Tensor,
+        nvb: int,
+        *,
+        mode: str,
+        write: bool,
+    ) -> None:
+        if self.capture_layer_idx < 0:
+            return
+        k3_capture(
+            "attn_res_static",
+            self.capture_layer_idx,
+            {
+                "score_cw_fp32": get_cw(score_proj, score_norm),
+                "out_norm_weight": out_norm.weight,
+            },
+            metadata={"epsilon": score_norm.variance_epsilon},
+            once=True,
+        )
+        k3_capture(
+            "attn_res",
+            self.capture_layer_idx,
+            {
+                "hidden_states": hidden_states,
+                "pending_prefix_sum": prefix_sum,
+                "block_residual": bank[:, :nvb],
+                "aggregated_prefix": prefix,
+                "normalized_output": normed,
+            },
+            metadata={"num_valid_blocks": nvb, "mode": mode, "write": write},
+        )
 
     def forward_sp_all_gather(
         self,
@@ -496,6 +551,19 @@ class AttnResidual:
             return None
         if write:
             self.num_valid_blocks += 1
+        self._capture(
+            hidden_states,
+            prefix_sum,
+            bank,
+            score_proj,
+            score_norm,
+            out_norm,
+            normed,
+            prefix,
+            nvb,
+            mode="sp_all_gather",
+            write=write,
+        )
         return normed, prefix
 
     def forward_sp_reduce_scatter(
@@ -520,7 +588,7 @@ class AttnResidual:
         assert score_norm.variance_epsilon == out_norm.variance_epsilon
         from sglang.srt.layers import k3_sp_collective
 
-        return k3_sp_collective.reduce_scatter_attn_res(
+        result = k3_sp_collective.reduce_scatter_attn_res(
             hidden_states,
             residual,
             bank,
@@ -529,3 +597,19 @@ class AttnResidual:
             nvb,
             score_norm.variance_epsilon,
         )
+        if result is not None:
+            normed, prefix = result
+            self._capture(
+                hidden_states,
+                residual,
+                bank,
+                score_proj,
+                score_norm,
+                out_norm,
+                normed,
+                prefix,
+                nvb,
+                mode="sp_reduce_scatter",
+                write=False,
+            )
+        return result

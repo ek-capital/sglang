@@ -8,6 +8,10 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from sglang.srt.debug_utils.k3_tensor_capture import (
+    k3_capture,
+    k3_capture_remaining_rows,
+)
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 from sglang.srt.layers.attention.linear.utils import (
@@ -34,6 +38,12 @@ elif is_cpu():
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+
+
+def _capture_row_major(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.ndim > 1 and tensor.shape[0] == 1:
+        return tensor.squeeze(0)
+    return tensor
 
 
 class KDAKernelDispatcher:
@@ -419,6 +429,38 @@ class KDAAttnBackend(MambaAttnBackendBase):
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
+        capture_rows = k3_capture_remaining_rows("kda_state_decode", layer.layer_id)
+        capture_indices = None
+        conv_states_before = None
+        ssm_states_before = None
+        if capture_rows > 0:
+            capture_indices = cache_indices[:capture_rows]
+            conv_states_before = conv_states[capture_indices].clone()
+            ssm_states_before = ssm_states[capture_indices].clone()
+
+        def capture_decode_result(core_attn_out, kernel: str):
+            if capture_indices is not None:
+                captured_mixed_qkv = (
+                    mixed_qkv if isinstance(mixed_qkv, torch.Tensor) else None
+                )
+                k3_capture(
+                    "kda_state_decode",
+                    layer.layer_id,
+                    {
+                        "mixed_qkv": captured_mixed_qkv,
+                        "forget_gate": _capture_row_major(a),
+                        "beta": _capture_row_major(b),
+                        "cache_indices": capture_indices,
+                        "conv_states_before": conv_states_before,
+                        "ssm_states_before": ssm_states_before,
+                        "conv_states_after": conv_states[capture_indices],
+                        "ssm_states_after": ssm_states[capture_indices],
+                        "core_attn_out": _capture_row_major(core_attn_out),
+                    },
+                    metadata={"kernel": kernel, "forward_mode": "decode"},
+                )
+            return core_attn_out
+
         # ReplaySSM is mostly a GDN bandwidth optimization. It remains wired for
         # KDA correctness paths, but packed decode is faster for KDA today.
         replayssm_write_pos = getattr(
@@ -485,7 +527,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     cache_indices,
                     layer.layer_id,
                 )
-                return core_attn_out
+                return capture_decode_result(core_attn_out, "k3_fused_decode")
             elif fused_static is not None and onorm_gate is not None:
                 # One-shot diagnostics: the model offered the handoff but the
                 # runtime shapes were rejected (decode stays on the unfused
@@ -539,7 +581,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             self._track_mamba_state_decode(
                 forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
             )
-            return core_attn_out
+            return capture_decode_result(core_attn_out, "packed_decode")
 
         q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
@@ -564,7 +606,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
         )
 
-        return core_attn_out
+        return capture_decode_result(core_attn_out, "decode")
 
     def forward_extend(
         self,
@@ -587,6 +629,15 @@ class KDAAttnBackend(MambaAttnBackendBase):
         conv_states = mamba_cache_params.conv[0].transpose(-1, -2)
 
         ssm_states = mamba_cache_params.temporal
+
+        capture_rows = k3_capture_remaining_rows("kda_state_extend", layer.layer_id)
+        capture_indices = None
+        conv_states_before = None
+        ssm_states_before = None
+        if capture_rows > 0:
+            capture_indices = cache_indices[:capture_rows]
+            conv_states_before = conv_states[capture_indices].clone()
+            ssm_states_before = ssm_states[capture_indices].clone()
 
         # Normal extend path
         if forward_batch.extend_prefix_lens is None:
@@ -686,6 +737,24 @@ class KDAAttnBackend(MambaAttnBackendBase):
             core_attn_out, h = core_attn_out
             self._track_mamba_state_extend(
                 forward_batch, h, ssm_states, self.forward_metadata
+            )
+
+        if capture_indices is not None:
+            k3_capture(
+                "kda_state_extend",
+                layer.layer_id,
+                {
+                    "cache_indices": capture_indices,
+                    "query_start_loc": query_start_loc,
+                    "conv_states_before": conv_states_before,
+                    "ssm_states_before": ssm_states_before,
+                    "conv_states_after": conv_states[capture_indices],
+                    "ssm_states_after": ssm_states[capture_indices],
+                },
+                metadata={
+                    "forward_mode": str(forward_batch.forward_mode),
+                    "extend_seq_lens": forward_batch.extend_seq_lens_cpu,
+                },
             )
 
         return core_attn_out

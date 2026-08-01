@@ -17,6 +17,10 @@ from torch import nn
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.srt.configs.kimi_k3 import KimiK3Config
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
+from sglang.srt.debug_utils.k3_tensor_capture import (
+    k3_capture,
+    k3_capture_wants,
+)
 from sglang.srt.distributed import (
     divide,
     get_pp_group,
@@ -950,10 +954,16 @@ class KimiK3MoE(nn.Module):
         # The gate and the latent down-proj read the same hidden_states, so the
         # merged-weight strategies compute both in one GEMM; see
         # kernels/ops/moe/moe_front.py for the strategy table.
-        routed_input = self._ep_front(hidden_states)
-        if routed_input is None:
+        capture_routing = k3_capture_wants("routing", self.layer_idx)
+        # The merged EP front intentionally does not materialize raw router
+        # logits. Corpus collection takes the semantically identical unfused
+        # projections so the replay artifact contains logits, routed input,
+        # and the resulting top-k decision together.
+        routed_input = None if capture_routing else self._ep_front(hidden_states)
+        if routed_input is None and not capture_routing:
             routed_input = self._ep_front_overlap(hidden_states)
         topk_output = None
+        router_logits = None
         if routed_input is not None:
             topk_output, routed_input = routed_input
         else:
@@ -986,6 +996,24 @@ class KimiK3MoE(nn.Module):
 
         if routed_input is None:
             routed_input, _ = self.routed_expert_down_proj(hidden_states)
+        if capture_routing:
+            k3_capture(
+                "routing_static",
+                self.layer_idx,
+                {"correction_bias": self.gate.e_score_correction_bias},
+                once=True,
+            )
+            k3_capture(
+                "routing",
+                self.layer_idx,
+                {
+                    "hidden_states": hidden_states,
+                    "router_logits": router_logits,
+                    "routed_input": routed_input,
+                    "topk_ids": topk_output.topk_ids,
+                    "topk_weights": topk_output.topk_weights,
+                },
+            )
         expert_output = (
             self._forward_mega_experts(routed_input, topk_output)
             if self._use_mega_moe
@@ -1219,13 +1247,18 @@ class KimiK3MoE(nn.Module):
         every rank (tp-fold redundant compute + a2a traffic)."""
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
+        k3_capture("moe_input", self.layer_idx, {"hidden_states": hidden_states})
         use_dp = self._dp_attention and forward_batch is not None and not self._ep_a2a
         if use_dp:
             local_hidden_states = hidden_states
             hidden_states = get_global_dp_buffer(get_tp_group())
             dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
             dp_prefix_sum, prefix_sum = prefix_sum, None
-        if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
+        if (
+            hidden_states.shape[0] > 0
+            and self._eligible_for_fused_front
+            and not k3_capture_wants("routing", self.layer_idx)
+        ):
             out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
         else:
             out = self._forward_unfused(hidden_states, prefix_sum=prefix_sum)
@@ -1235,6 +1268,7 @@ class KimiK3MoE(nn.Module):
             dp_scatter(out, global_out, forward_batch)
             if dp_prefix_sum is not None:
                 out = out + dp_prefix_sum
+        k3_capture("moe_output", self.layer_idx, {"hidden_states": out})
         return out.view(num_tokens, hidden_size)
 
 
@@ -1705,6 +1739,20 @@ class KimiK3DeltaAttention(nn.Module):
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)
 
+        k3_capture(
+            "kda",
+            self.layer_idx,
+            {
+                "hidden_states": hidden_states,
+                "positions": positions,
+                "mixed_qkv": mixed_qkv,
+                "forget_gate": forget_gate.squeeze(0),
+                "beta": beta.squeeze(0),
+                "output_norm_gate": g_proj_states,
+            },
+            metadata={"forward_mode": str(forward_batch.forward_mode)},
+        )
+
         # Fused KDA handoff (attempt-and-verify): offer the output-norm gate
         # so covered decode and target-verify kernels can fold gated RMSNorm
         # into the recurrence kernel. If the backend leaves the stash
@@ -1862,6 +1910,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                     # join across graph-segment boundaries.
                     torch.cuda.current_stream().wait_stream(precomputed[1])
                 if gate_input is not None and not isinstance(x, tuple):
+                    attention_core = x
                     gate = (
                         precomputed[0]
                         if precomputed is not None
@@ -1875,9 +1924,38 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                         x = mla_output_gate.kimi_k3_mla_output_gate(x, gate)
                     else:
                         x = x * torch.sigmoid(gate)
+                    k3_capture(
+                        "mla_gate",
+                        layer_idx,
+                        {
+                            "hidden_states": gate_input,
+                            "attention_core": attention_core,
+                            "gate_logits": gate,
+                            "gated_attention": x,
+                        },
+                    )
                 return _orig_o_proj_forward(x, *args, **kwargs)
 
             self.o_proj.forward = _gated_o_proj_forward
+
+    def prepare_qkv_latent(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ):
+        packed_qkv_latent = super().prepare_qkv_latent(hidden_states, forward_batch)
+        k3_capture(
+            "mla_latent",
+            self.layer_id,
+            {
+                "hidden_states": hidden_states,
+                "packed_qkv_latent": packed_qkv_latent,
+            },
+            metadata={
+                "forward_mode": str(forward_batch.forward_mode),
+                "q_lora_rank": self.q_lora_rank,
+                "kv_lora_rank": self.kv_lora_rank,
+            },
+        )
+        return packed_qkv_latent
 
     def _precompute_output_gate(self, hidden_states: torch.Tensor) -> None:
         """Issue the output-gate GEMM on the alt stream so it overlaps the
@@ -2195,6 +2273,15 @@ class KimiK3DecoderLayer(nn.Module):
             attn_inputs = AttentionInputs(hidden_states, forward_batch, qkv_latent_func)
             get_attn_tp_context().set_attn_inputs(attn_inputs)
 
+        k3_capture(
+            "attention_input",
+            self.layer_idx,
+            {"hidden_states": hidden_states, "positions": positions},
+            metadata={
+                "attention_kind": self.self_attn.__class__.__name__,
+                "forward_mode": str(forward_batch.forward_mode),
+            },
+        )
         result = self.self_attn(
             hidden_states=hidden_states,
             positions=positions,
@@ -2204,6 +2291,13 @@ class KimiK3DecoderLayer(nn.Module):
 
         if qkv_latent_func is not None:
             get_attn_tp_context().clear_attn_inputs()
+
+        k3_capture(
+            "attention_output",
+            self.layer_idx,
+            {"hidden_states": result},
+            metadata={"attention_kind": self.self_attn.__class__.__name__},
+        )
 
         return result
 
@@ -2535,7 +2629,36 @@ class KimiK3LinearModel(nn.Module):
             if sp_sharded and not self.layers[i]._sp_moe:
                 hidden_states = _sp_all_gather_rows(hidden_states)
                 sp_sharded = False
+            attn_res_nvb = 0
+            if attn_res is not None:
+                attn_res_nvb = attn_res.num_valid_blocks
+                k3_capture(
+                    "attn_res_state",
+                    i,
+                    {
+                        "hidden_states": hidden_states,
+                        "prefix_sum": residual,
+                        "block_residual": attn_res.block_residual[:, :attn_res_nvb],
+                    },
+                    metadata={"num_valid_blocks": attn_res_nvb},
+                )
+            k3_capture(
+                "layer_input",
+                i,
+                {
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                    "positions": positions,
+                },
+                metadata={
+                    "forward_mode": str(forward_batch.forward_mode),
+                    "sp_sharded": sp_sharded,
+                    "attn_res_valid_blocks": attn_res_nvb,
+                },
+            )
             with get_global_expert_distribution_recorder().with_current_layer(i):
+                if attn_res is not None:
+                    attn_res.capture_layer_idx = i
                 hidden_states, residual, sp_sharded = self.layers[i](
                     positions=positions,
                     hidden_states=hidden_states,
@@ -2546,6 +2669,21 @@ class KimiK3LinearModel(nn.Module):
                     input_sharded=sp_sharded,
                     keep_sharded=sp_attn_res,
                 )
+            k3_capture(
+                "layer_output",
+                i,
+                {
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                },
+                metadata={
+                    "forward_mode": str(forward_batch.forward_mode),
+                    "sp_sharded": sp_sharded,
+                    "attn_res_valid_blocks": (
+                        0 if attn_res is None else attn_res.num_valid_blocks
+                    ),
+                },
+            )
             if (
                 self.dspark_layers_to_capture is not None
                 and i in self.dspark_layers_to_capture
@@ -2707,13 +2845,23 @@ class KimiK3LinearForCausalLM(nn.Module):
             aux_hidden_states = None
             if self.capture_aux_hidden_states:
                 hidden_states, aux_hidden_states = hidden_states
-            return self.logits_processor(
+            result = self.logits_processor(
                 input_ids,
                 hidden_states,
                 self.lm_head,
                 forward_batch,
                 aux_hidden_states,
             )
+            k3_capture(
+                "lm_head",
+                self.config.num_hidden_layers,
+                {
+                    "hidden_states": hidden_states,
+                    "next_token_logits": getattr(result, "next_token_logits", None),
+                },
+                metadata={"forward_mode": str(forward_batch.forward_mode)},
+            )
+            return result
         return hidden_states
 
     def prepare_context_parallel_metadata_for_dcp(
