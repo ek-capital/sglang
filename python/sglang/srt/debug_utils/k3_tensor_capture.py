@@ -453,16 +453,20 @@ class K3TensorCapture:
             - self._rows_by_phase.get(key, 0),
         )
 
-    @staticmethod
-    def _gpu_sample_indices(row_count: int, take: int, device: torch.device) -> torch.Tensor:
-        """Deterministic, position-stratified sampling performed on GPU."""
+    def _gpu_sample_indices(
+        self, row_count: int, take: int, device: torch.device
+    ) -> torch.Tensor:
+        """Deterministic GPU sampling, interleaved across TP-rank strata."""
         if take >= row_count:
             return torch.arange(row_count, device=device, dtype=torch.long)
-        # One deterministic representative from each equal-width position bin.
+        denominator = take * self.world_size
+        strata = (
+            torch.arange(take, device=device, dtype=torch.long) * self.world_size
+            + self.rank
+        )
         return torch.div(
-            torch.arange(take, device=device, dtype=torch.long) * row_count
-            + row_count // (2 * take),
-            take,
+            strata * row_count + denominator // 2,
+            denominator,
             rounding_mode="floor",
         ).clamp_max_(row_count - 1)
 

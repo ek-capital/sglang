@@ -210,3 +210,12 @@ def test_expert_quota_sampling_records_assignment_coverage(tmp_path, monkeypatch
     quota = next(record for record in records if record["record_type"] == "expert_quota")
     assert quota["experts_at_quota"] == 4
     assert quota["min_assignments"] == 2
+
+
+def test_gpu_sampling_interleaves_tp_rank_strata(tmp_path, monkeypatch):
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_DIR", str(tmp_path))
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_RANK", "3")
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_WORLD_SIZE", "8")
+    capture = K3TensorCapture()
+    indices = capture._gpu_sample_indices(800, 10, torch.device("cpu"))
+    assert indices.tolist() == [30, 110, 190, 270, 350, 430, 510, 590, 670, 750]
