@@ -106,3 +106,20 @@ def test_k3_tensor_capture_uses_live_distributed_rank(tmp_path, monkeypatch):
     assert capture.world_size == 8
     assert capture.rank_allowed
     assert (tmp_path / "rank-00003" / "manifest.jsonl").is_file()
+
+
+def test_capture_path_is_tp_uniform_but_writes_remain_rank_filtered(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_DIR", str(tmp_path))
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_POINTS", "routing")
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_RANKS", "0")
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_RANK", "5")
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_WORLD_SIZE", "8")
+
+    capture = K3TensorCapture()
+
+    assert capture.path_wants("routing", 1)
+    assert not capture.wants("routing", 1)
+    assert capture.capture("routing", 1, {"x": torch.ones(1)}) is None
+    assert not (tmp_path / "rank-00005").exists()

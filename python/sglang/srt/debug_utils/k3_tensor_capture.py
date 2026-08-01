@@ -187,14 +187,18 @@ class K3TensorCapture:
             with self._manifest.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(run_record, sort_keys=True) + "\n")
 
-    def wants(self, point: str, layer_idx: int) -> bool:
+    def path_wants(self, point: str, layer_idx: int) -> bool:
+        """Whether every TP rank must take the capture-compatible code path."""
         return (
             self.enabled
-            and self.rank_allowed
             and (self.arm_file is None or self.arm_file.exists())
             and point in self.points
             and (self.layers is None or layer_idx in self.layers)
         )
+
+    def wants(self, point: str, layer_idx: int) -> bool:
+        """Whether this rank should serialize the requested capture point."""
+        return self.rank_allowed and self.path_wants(point, layer_idx)
 
     def _row_limit(self, point: str) -> int:
         env_name = "SGLANG_K3_CAPTURE_MAX_ROWS_" + point.upper().replace("-", "_")
@@ -314,7 +318,9 @@ def get_k3_tensor_capture() -> K3TensorCapture:
 
 
 def k3_capture_wants(point: str, layer_idx: int) -> bool:
-    return get_k3_tensor_capture().wants(point, layer_idx)
+    # This predicate controls graph structure in K3's router.  Every TP rank
+    # must choose the same fused/unfused path even when only one rank writes.
+    return get_k3_tensor_capture().path_wants(point, layer_idx)
 
 
 def k3_capture_remaining_rows(point: str, layer_idx: int) -> int:
