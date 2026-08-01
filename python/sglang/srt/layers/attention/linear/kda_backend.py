@@ -46,6 +46,55 @@ def _capture_row_major(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def _kda_chunk_transitions(
+    h: torch.Tensor,
+    final_states: torch.Tensor,
+    seq_lens: list[int],
+    *,
+    chunk_size: int = 64,
+) -> dict[str, torch.Tensor]:
+    """Build before/after recurrent-state rows for packed KDA chunks.
+
+    Triton returns ``h`` as the state *before* each packed chunk.  The state
+    after a non-final chunk is therefore the next row for the same sequence;
+    the final chunk's after-state is the state committed to the cache pool.
+    """
+    counts = [(int(length) + chunk_size - 1) // chunk_size for length in seq_lens]
+    total_chunks = sum(counts)
+    before = h.squeeze(0)[:total_chunks]
+    if before.shape[0] != total_chunks:
+        raise RuntimeError(
+            f"KDA returned {before.shape[0]} chunk states for {total_chunks} chunks"
+        )
+
+    after = torch.empty_like(before)
+    sequence_index = torch.empty(total_chunks, dtype=torch.int32, device=h.device)
+    chunk_index = torch.empty_like(sequence_index)
+    token_start = torch.empty_like(sequence_index)
+    token_end = torch.empty_like(sequence_index)
+    cursor = 0
+    for seq_idx, (seq_len, count) in enumerate(zip(seq_lens, counts, strict=True)):
+        end = cursor + count
+        if count > 1:
+            after[cursor : end - 1].copy_(before[cursor + 1 : end])
+        after[end - 1].copy_(final_states[seq_idx])
+        positions = torch.arange(count, dtype=torch.int32, device=h.device)
+        sequence_index[cursor:end].fill_(seq_idx)
+        chunk_index[cursor:end].copy_(positions)
+        token_start[cursor:end].copy_(positions * chunk_size)
+        token_end[cursor:end].copy_((positions + 1).mul(chunk_size).clamp_max(seq_len))
+        cursor = end
+
+    return {
+        "ssm_state_before": before,
+        "ssm_state_after": after,
+        "sequence_index": sequence_index,
+        "chunk_index": chunk_index,
+        "token_start": token_start,
+        "token_end": token_end,
+    }
+
+
 class KDAKernelDispatcher:
     """Dispatches KDA kernel calls to the appropriate backend per mode."""
 
@@ -630,14 +679,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         ssm_states = mamba_cache_params.temporal
 
-        capture_rows = k3_capture_remaining_rows("kda_state_extend", layer.layer_id)
-        capture_indices = None
-        conv_states_before = None
-        ssm_states_before = None
-        if capture_rows > 0:
-            capture_indices = cache_indices[:capture_rows]
-            conv_states_before = conv_states[capture_indices].clone()
-            ssm_states_before = ssm_states[capture_indices].clone()
+        capture_chunk_states = (
+            k3_capture_remaining_rows("kda_state_extend", layer.layer_id) > 0
+        )
 
         # Normal extend path
         if forward_batch.extend_prefix_lens is None:
@@ -706,6 +750,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
 
         track_ssm = self.forward_metadata.has_mamba_track_mask
+        return_intermediate_states = track_ssm or capture_chunk_states
         core_attn_out = self.kernel_dispatcher.extend(
             q=q,
             k=k,
@@ -722,7 +767,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # draft_extend_v2 must stay rollback-able, so kernels that commit state
             # in place (e.g. FlashKDA) must not run for it.
             is_spec_decode=forward_batch.forward_mode.is_draft_extend_v2(),
-            return_intermediate_states=track_ssm,
+            return_intermediate_states=return_intermediate_states,
             # Which global chunk rows of h the track snapshot will read; lets
             # kernels that cannot materialize per-chunk states (NVIDIA KDA) take the
             # fast path when the snapshot only needs the final state.
@@ -730,30 +775,31 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 self.forward_metadata.track_ssm_h_src if track_ssm else None
             ),
         )
+        h = None
+        if return_intermediate_states:
+            core_attn_out, h = core_attn_out
         if track_ssm:
             # Snapshot the SSM state at the last track-aligned chunk boundary
             # from the kernel's per-chunk states (h) / final states into the
             # ping-pong track slots (see _init_track_ssm_indices).
-            core_attn_out, h = core_attn_out
+            assert h is not None
             self._track_mamba_state_extend(
                 forward_batch, h, ssm_states, self.forward_metadata
             )
 
-        if capture_indices is not None:
+        if capture_chunk_states:
+            assert h is not None
+            seq_lens = [int(length) for length in forward_batch.extend_seq_lens_cpu]
+            final_states = ssm_states.index_select(0, cache_indices.to(torch.long))
             k3_capture(
                 "kda_state_extend",
                 layer.layer_id,
-                {
-                    "cache_indices": capture_indices,
-                    "query_start_loc": query_start_loc,
-                    "conv_states_before": conv_states_before,
-                    "ssm_states_before": ssm_states_before,
-                    "conv_states_after": conv_states[capture_indices],
-                    "ssm_states_after": ssm_states[capture_indices],
-                },
+                _kda_chunk_transitions(h, final_states, seq_lens),
                 metadata={
                     "forward_mode": str(forward_batch.forward_mode),
-                    "extend_seq_lens": forward_batch.extend_seq_lens_cpu,
+                    "extend_seq_lens": seq_lens,
+                    "chunk_size": 64,
+                    "state_semantics": "before_and_after_each_packed_chunk",
                 },
             )
 
