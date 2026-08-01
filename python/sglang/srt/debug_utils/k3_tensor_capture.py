@@ -526,6 +526,17 @@ class K3TensorCapture:
         tensor_meta: dict[str, Any] = {}
         current_stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
         copy_event = None
+        # Materialize sampled tensors on the model stream.  Selecting on the
+        # copy stream would let the model stream immediately reuse or mutate
+        # the source buffers while index_select was still reading them.
+        prepared: dict[str, torch.Tensor] = {}
+        for name, value in present.items():
+            selected = (
+                value.index_select(0, indices)
+                if not once and value.ndim > 0 and value.shape[0] == row_count
+                else value.detach().contiguous()
+            )
+            prepared[name] = selected.contiguous()
         if self._copy_stream is not None and current_stream is not None:
             self._copy_stream.wait_stream(current_stream)
         stream_context = (
@@ -537,13 +548,8 @@ class K3TensorCapture:
             for name, value in present.items():
                 original_shape = list(value.shape)
                 original_stride = list(value.stride())
-                selected = (
-                    value.index_select(0, indices)
-                    if not once and value.ndim > 0 and value.shape[0] == row_count
-                    else value.detach().contiguous()
-                )
+                selected = prepared[name]
                 if selected.device.type == "cuda":
-                    selected = selected.contiguous()
                     host = torch.empty_like(selected, device="cpu", pin_memory=True)
                     host.copy_(selected, non_blocking=True)
                     selected.record_stream(self._copy_stream)
