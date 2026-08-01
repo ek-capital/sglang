@@ -17,6 +17,7 @@ rows are not silently sharded or remapped.
 
 ```bash
 export SGLANG_K3_CAPTURE_DIR=/data/k3-capture
+export SGLANG_K3_CAPTURE_ARM_FILE=/data/k3-capture.armed
 export SGLANG_K3_CAPTURE_RUN_ID=k3-full-$(date -u +%Y%m%dT%H%M%SZ)
 export SGLANG_K3_CAPTURE_MODEL_REVISION=9f62e4e9fffbd0a83ddd60e1c209d828994b3569
 export SGLANG_K3_CAPTURE_SGLANG_REVISION=52522121501
@@ -38,6 +39,14 @@ python -m sglang.launch_server \
   --tp-size 8 \
   --language-only \
   --disable-cuda-graph
+```
+
+Wait until the server is healthy, then create the arm file before sending the
+first corpus request. This prevents profiling and warm-up forwards from
+consuming the row limits with synthetic inputs:
+
+```bash
+touch /data/k3-capture.armed
 ```
 
 Send a stratified prompt corpus to the normal server endpoint. Capture keeps

@@ -69,3 +69,18 @@ def test_k3_tensor_capture_disabled_by_default(monkeypatch):
     capture = K3TensorCapture()
     assert not capture.enabled
     assert capture.capture("routing", 0, {"x": torch.ones(1)}) is None
+
+
+def test_k3_tensor_capture_waits_for_arm_file(tmp_path, monkeypatch):
+    arm_file = tmp_path / "ARMED"
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_DIR", str(tmp_path / "capture"))
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_ARM_FILE", str(arm_file))
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_POINTS", "layer_input")
+
+    capture = K3TensorCapture()
+    assert not capture.wants("layer_input", 0)
+    assert capture.capture("layer_input", 0, {"x": torch.ones(1)}) is None
+
+    arm_file.touch()
+    assert capture.wants("layer_input", 0)
+    assert capture.capture("layer_input", 0, {"x": torch.ones(1)}) is not None

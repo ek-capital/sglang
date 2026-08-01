@@ -83,6 +83,8 @@ class K3TensorCapture:
         capture_dir = os.environ.get("SGLANG_K3_CAPTURE_DIR", "").strip()
         self.enabled = bool(capture_dir)
         self.root = Path(capture_dir) if capture_dir else None
+        arm_file = os.environ.get("SGLANG_K3_CAPTURE_ARM_FILE", "").strip()
+        self.arm_file = Path(arm_file) if arm_file else None
         self.rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
         self.local_rank = int(os.environ.get("LOCAL_RANK", str(self.rank)))
         self.tp_rank = int(os.environ.get("TP_RANK", str(self.rank)))
@@ -135,6 +137,7 @@ class K3TensorCapture:
         return (
             self.enabled
             and self.rank_allowed
+            and (self.arm_file is None or self.arm_file.exists())
             and point in self.points
             and (self.layers is None or layer_idx in self.layers)
         )
