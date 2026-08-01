@@ -154,6 +154,7 @@ QUANTIZATION_CHOICES = [
     "w8a8_int8",  # mentioned in quantization.md documentation, supporting compressed-tensors quant_method.
     "w8a8_fp8",  # mentioned in quantization.md documentation, supporting compressed-tensors quant_method.
     "moe_wna16",  # custom loading logic for gptq/awq checkpoints (likely untested/unused)
+    "kimi_k3_w2a16",  # Kimi-K3 routed experts, fused W2 dequant + A16 MoE
     "w4afp8",
     "mxfp4",  # MOE-only.
     "auto-round",
@@ -262,6 +263,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "humming",
     "experimental_sgl_marlin",
     "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), FP8 MoE on Hopper (SM90) only
+    "k3_w2a16",
 ]
 
 MOE_A2A_BACKEND_CHOICES = [

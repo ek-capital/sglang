@@ -521,6 +521,10 @@ class KimiK3MoE(nn.Module):
         # (e.g. marlin) require a dense buffer.
         self._moe_front_needs_contiguous = (
             not get_moe_runner_backend().is_flashinfer_mxfp4()
+            or (
+                quant_config is not None
+                and quant_config.get_name() == "kimi_k3_w2a16"
+            )
         )
 
         # Defer the trtllm-gen finalize (top-k weighted unpermute) out of the
@@ -532,6 +536,10 @@ class KimiK3MoE(nn.Module):
         self._defer_moe_finalize = (
             get_moe_runner_backend().is_flashinfer_mxfp4()
             and config.hidden_act == "situ"
+            and (
+                quant_config is None
+                or quant_config.get_name() != "kimi_k3_w2a16"
+            )
         )
 
         # Shared experts (operate in original hidden_size space).

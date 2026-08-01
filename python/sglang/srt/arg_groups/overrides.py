@@ -2215,6 +2215,14 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     disable_shared_experts_fusion writes (post-publish writers exist for that
     field) stay in the handler."""
     moe_runner_backend = view.moe_runner_backend
+    if view.quantization == "kimi_k3_w2a16":
+        if moe_runner_backend == "auto":
+            moe_runner_backend = "k3_w2a16"
+        elif moe_runner_backend != "k3_w2a16":
+            raise ValueError(
+                "--quantization kimi_k3_w2a16 requires "
+                "--moe-runner-backend k3_w2a16."
+            )
     if view.quantization == "nvfp4_online":
         if not is_sm100_supported():
             raise ValueError(

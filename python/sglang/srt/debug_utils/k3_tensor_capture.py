@@ -35,6 +35,8 @@ _DEFAULT_POINTS = {
     "mla_latent",
     "mla_gate",
     "moe_input",
+    "moe_w13_input",
+    "moe_w2_input",
     "moe_output",
     "routing",
     "routing_static",

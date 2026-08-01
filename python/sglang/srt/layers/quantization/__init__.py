@@ -35,6 +35,7 @@ from sglang.srt.layers.quantization.gptq import (
     GPTQMarlinConfig,
 )
 from sglang.srt.layers.quantization.humming import HummingConfig
+from sglang.srt.layers.quantization.kimi_k3_w2a16 import KimiK3W2A16Config
 from sglang.srt.layers.quantization.mlx import MlxQuantizationConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
@@ -88,6 +89,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "gptq": GPTQConfig,
     "gptq_marlin": GPTQMarlinConfig,
     "moe_wna16": MoeWNA16Config,
+    "kimi_k3_w2a16": KimiK3W2A16Config,
     "compressed-tensors": CompressedTensorsConfig,
     "w4afp8": W4AFp8Config,
     "petit_nvfp4": PetitNvFp4Config,
