@@ -175,6 +175,7 @@ class K3TensorCapture:
         self._rows: dict[tuple[str, int], int] = {}
         self._rows_by_phase: dict[tuple[str, int, str], int] = {}
         self._events: dict[tuple[str, int], int] = {}
+        self._calls: dict[tuple[str, int], int] = {}
         self._expert_counts: dict[tuple[int, str], torch.Tensor] = {}
         self._lock = threading.Lock()
         self._process_dir: Path | None = None
@@ -204,6 +205,9 @@ class K3TensorCapture:
         self._shard_seq = 0
         self.delete_local_after_upload = os.environ.get(
             "SGLANG_K3_CAPTURE_DELETE_LOCAL_AFTER_UPLOAD", "1"
+        ).lower() in {"1", "true", "yes"}
+        self.split_rows_across_ranks = os.environ.get(
+            "SGLANG_K3_CAPTURE_SPLIT_ROWS_ACROSS_RANKS", "0"
         ).lower() in {"1", "true", "yes"}
 
         if self.enabled and self.rank_allowed:
@@ -598,6 +602,8 @@ class K3TensorCapture:
         key = (point, layer_idx)
         with self._lock:
             self._check_async_error()
+            call_index = self._calls.get(key, 0)
+            self._calls[key] = call_index + 1
             if once and self._events.get(key, 0) > 0:
                 return None
             phase = self._phase(metadata)
@@ -622,6 +628,15 @@ class K3TensorCapture:
                 )
             )
             take = min(row_count, remaining)
+            if self.async_enabled and self.split_rows_across_ranks and not once:
+                if row_count < self.world_size:
+                    if call_index % self.world_size != self.rank:
+                        return None
+                else:
+                    take = min(
+                        take,
+                        (row_count + self.world_size - 1) // self.world_size,
+                    )
             if take <= 0:
                 return None
 

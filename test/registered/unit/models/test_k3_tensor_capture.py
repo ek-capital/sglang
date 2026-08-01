@@ -219,3 +219,32 @@ def test_gpu_sampling_interleaves_tp_rank_strata(tmp_path, monkeypatch):
     capture = K3TensorCapture()
     indices = capture._gpu_sample_indices(800, 10, torch.device("cpu"))
     assert indices.tolist() == [30, 110, 190, 270, 350, 430, 510, 590, 670, 750]
+
+
+def test_single_row_decode_calls_are_round_robined_across_ranks(tmp_path, monkeypatch):
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_DIR", str(tmp_path))
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_ASYNC", "1")
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_SPLIT_ROWS_ACROSS_RANKS", "1")
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_RANK", "1")
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_WORLD_SIZE", "2")
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_RANKS", "all")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    capture = K3TensorCapture()
+    value = torch.ones(1, 4)
+
+    assert capture.capture("layer_input", 0, {"x": value}) is None
+    assert capture.capture("layer_input", 0, {"x": value}) is not None
+    capture.close()
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "rank-00001" / "manifest.jsonl").read_text().splitlines()
+    ]
+    entries = [
+        entry
+        for record in records
+        if record["record_type"] == "shard"
+        for entry in record["entries"]
+    ]
+    assert len(entries) == 1
+    assert entries[0]["rows"] == 1
