@@ -38,10 +38,27 @@ def main() -> None:
     validated_shards = []
     manifest_paths = []
     expert_quotas = []
+    truncated_manifest_records = []
     for manifest in sorted(args.capture_dir.glob("rank-*/manifest.jsonl")):
         manifest_paths.append(manifest)
-        for line in manifest.read_text(encoding="utf-8").splitlines():
-            record = json.loads(line)
+        manifest_size = manifest.stat().st_size
+        with manifest.open(encoding="utf-8") as handle:
+            numbered_lines = list(enumerate(handle, 1))
+        for line_number, line in numbered_lines:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                is_unterminated_tail = (
+                    line_number == len(numbered_lines)
+                    and not line.endswith("\n")
+                    and manifest.stat().st_size == manifest_size
+                )
+                if not is_unterminated_tail:
+                    raise
+                truncated_manifest_records.append(
+                    f"{manifest.relative_to(args.capture_dir)}:{line_number}"
+                )
+                continue
             if record.get("record_type") == "expert_quota":
                 expert_quotas.append(record)
                 continue
@@ -86,6 +103,12 @@ def main() -> None:
 
     if files == 0:
         raise SystemExit("no capture records found")
+    if truncated_manifest_records:
+        print(
+            "warning: ignored unterminated final manifest records: "
+            + ", ".join(truncated_manifest_records),
+            flush=True,
+        )
 
     validated_manifests = []
     if args.skip_hash:
