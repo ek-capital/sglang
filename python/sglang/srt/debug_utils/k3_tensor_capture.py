@@ -1,22 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 """Bounded, opt-in tensor capture for Kimi-K3 replay datasets.
 
-This module is intentionally inert unless ``SGLANG_K3_CAPTURE_DIR`` is set.
-Capture is synchronous: tensors are cloned to CPU before the hotloop can reuse
-their storage, then written as atomic safetensors shards plus a JSONL manifest.
-That is slower than serving, but it makes a one-off corpus collection reliable.
+The scalable path samples token rows on GPU, stages them into pinned host
+memory on a dedicated CUDA stream, packs many capture entries into large local
+NVMe safetensors shards, and uploads completed shards in the background.  The
+legacy synchronous path remains available for small smoke tests.
 """
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
 import os
+import queue
+import shutil
 import threading
 import time
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 
@@ -38,9 +41,22 @@ _DEFAULT_POINTS = {
     "moe_w13_input",
     "moe_w2_input",
     "moe_output",
+    "expert_output",
     "routing",
     "routing_static",
 }
+
+
+class _PendingCapture(NamedTuple):
+    event: Any
+    tensors: dict[str, torch.Tensor]
+    record: dict[str, Any]
+    nbytes: int
+
+
+class _CompletedShard(NamedTuple):
+    local_path: Path
+    record: dict[str, Any]
 
 
 def _parse_layers(value: str) -> set[int] | None:
@@ -157,10 +173,38 @@ class K3TensorCapture:
             int(item) for item in rank_filter.split(",") if item.strip()
         }
         self._rows: dict[tuple[str, int], int] = {}
+        self._rows_by_phase: dict[tuple[str, int, str], int] = {}
         self._events: dict[tuple[str, int], int] = {}
+        self._expert_counts: dict[tuple[int, str], torch.Tensor] = {}
         self._lock = threading.Lock()
         self._process_dir: Path | None = None
         self._manifest: Path | None = None
+        self._context: dict[str, Any] = {}
+        self.async_enabled = self.enabled and os.environ.get(
+            "SGLANG_K3_CAPTURE_ASYNC", "0"
+        ).lower() in {"1", "true", "yes"}
+        self.shard_target_bytes = int(
+            float(os.environ.get("SGLANG_K3_CAPTURE_SHARD_MB", "256")) * 2**20
+        )
+        self.expert_quota = max(
+            0, int(os.environ.get("SGLANG_K3_CAPTURE_EXPERT_QUOTA", "0"))
+        )
+        self.num_experts = max(
+            1, int(os.environ.get("SGLANG_K3_CAPTURE_NUM_EXPERTS", "896"))
+        )
+        self._copy_stream: Any = None
+        self._pending_queue: queue.Queue[Any] | None = None
+        self._upload_queue: queue.Queue[Any] | None = None
+        self._writer_thread: threading.Thread | None = None
+        self._uploader_thread: threading.Thread | None = None
+        self._async_error: BaseException | None = None
+        self._closed = False
+        self._local_process_dir: Path | None = None
+        self._local_manifest: Path | None = None
+        self._shard_seq = 0
+        self.delete_local_after_upload = os.environ.get(
+            "SGLANG_K3_CAPTURE_DELETE_LOCAL_AFTER_UPLOAD", "1"
+        ).lower() in {"1", "true", "yes"}
 
         if self.enabled and self.rank_allowed:
             assert self.root is not None
@@ -183,9 +227,199 @@ class K3TensorCapture:
                 "points": sorted(self.points),
                 "layers": "all" if self.layers is None else sorted(self.layers),
                 "default_max_rows": self.default_max_rows,
+                "async_capture": self.async_enabled,
+                "shard_target_bytes": self.shard_target_bytes,
+                "expert_quota": self.expert_quota,
             }
             with self._manifest.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(run_record, sort_keys=True) + "\n")
+            if self.async_enabled:
+                local_root = Path(
+                    os.environ.get("SGLANG_K3_CAPTURE_LOCAL_DIR", str(self.root))
+                )
+                self._local_process_dir = local_root / f"rank-{self.rank:05d}"
+                self._local_process_dir.mkdir(parents=True, exist_ok=True)
+                self._local_manifest = self._local_process_dir / "manifest.jsonl"
+                if self._local_manifest != self._manifest:
+                    with self._local_manifest.open("a", encoding="utf-8") as handle:
+                        handle.write(json.dumps(run_record, sort_keys=True) + "\n")
+                max_pending = max(
+                    1, int(os.environ.get("SGLANG_K3_CAPTURE_MAX_PENDING", "8"))
+                )
+                self._pending_queue = queue.Queue(maxsize=max_pending)
+                self._upload_queue = queue.Queue(maxsize=2)
+                if torch.cuda.is_available():
+                    self._copy_stream = torch.cuda.Stream(device=self.local_rank)
+                self._writer_thread = threading.Thread(
+                    target=self._writer_loop,
+                    name=f"k3-capture-writer-r{self.rank}",
+                    daemon=True,
+                )
+                self._uploader_thread = threading.Thread(
+                    target=self._uploader_loop,
+                    name=f"k3-capture-uploader-r{self.rank}",
+                    daemon=True,
+                )
+                self._writer_thread.start()
+                self._uploader_thread.start()
+                atexit.register(self.close)
+
+    def set_forward_context(self, forward_batch: Any) -> None:
+        """Attach phase/cache strata to all capture points in this forward."""
+        mode = str(getattr(forward_batch, "forward_mode", "unknown")).lower()
+        phase = "decode" if "decode" in mode else "prefill"
+        prefix_lens = getattr(forward_batch, "extend_prefix_lens_cpu", None) or []
+        seq_lens = getattr(forward_batch, "extend_seq_lens_cpu", None) or []
+        max_prefix = max((int(x) for x in prefix_lens), default=0)
+        max_seq = max((int(x) for x in seq_lens), default=0)
+        self._context = {
+            "phase": phase,
+            "forward_mode": mode,
+            "prefix_cache": "hit" if max_prefix > 0 else "miss",
+            "max_prefix_len": max_prefix,
+            "max_sequence_len": max_seq,
+            "batch_size": int(getattr(forward_batch, "batch_size", 0) or 0),
+            "tp_rank": self.tp_rank,
+        }
+
+    def _phase(self, metadata: Mapping[str, Any] | None) -> str:
+        value = str((metadata or {}).get("phase", self._context.get("phase", "all")))
+        return value.lower()
+
+    def _check_async_error(self) -> None:
+        if self._async_error is not None:
+            raise RuntimeError("K3 asynchronous capture worker failed") from self._async_error
+
+    def _append_manifest(self, path: Path, record: Mapping[str, Any]) -> None:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+
+    def _writer_loop(self) -> None:
+        from safetensors.torch import save_file
+
+        pending: list[_PendingCapture] = []
+        pending_bytes = 0
+
+        def flush() -> None:
+            nonlocal pending, pending_bytes
+            if not pending:
+                return
+            assert self._local_process_dir is not None
+            assert self._local_manifest is not None
+            tensors: dict[str, torch.Tensor] = {}
+            entries: list[dict[str, Any]] = []
+            for entry_idx, item in enumerate(pending):
+                if item.event is not None:
+                    item.event.synchronize()
+                tensor_keys = {}
+                for name, value in item.tensors.items():
+                    key = f"e{entry_idx:05d}__{name}"
+                    tensors[key] = value
+                    tensor_keys[name] = key
+                record = dict(item.record)
+                record["tensor_keys"] = tensor_keys
+                entries.append(record)
+            name = f"shard-{self._shard_seq:06d}.safetensors"
+            self._shard_seq += 1
+            final_path = self._local_process_dir / name
+            tmp_path = self._local_process_dir / f".{name}.{os.getpid()}.tmp"
+            save_file(tensors, str(tmp_path))
+            os.replace(tmp_path, final_path)
+            shard_record = {
+                "record_type": "shard",
+                "format_version": 2,
+                "created_unix_ns": time.time_ns(),
+                "rank": self.rank,
+                "file": name,
+                "size": final_path.stat().st_size,
+                "sha256": _sha256_file(final_path),
+                "entries": entries,
+            }
+            self._append_manifest(self._local_manifest, shard_record)
+            assert self._upload_queue is not None
+            self._upload_queue.put(_CompletedShard(final_path, shard_record))
+            pending = []
+            pending_bytes = 0
+
+        try:
+            assert self._pending_queue is not None
+            while True:
+                try:
+                    item = self._pending_queue.get(timeout=2.0)
+                except queue.Empty:
+                    flush()
+                    continue
+                if item is None:
+                    flush()
+                    self._pending_queue.task_done()
+                    break
+                pending.append(item)
+                pending_bytes += item.nbytes
+                self._pending_queue.task_done()
+                if pending_bytes >= self.shard_target_bytes:
+                    flush()
+        except BaseException as exc:
+            self._async_error = exc
+        finally:
+            if self._upload_queue is not None:
+                self._upload_queue.put(None)
+
+    def _uploader_loop(self) -> None:
+        try:
+            assert self._upload_queue is not None
+            assert self._process_dir is not None and self._manifest is not None
+            while True:
+                item = self._upload_queue.get()
+                if item is None:
+                    self._upload_queue.task_done()
+                    break
+                assert isinstance(item, _CompletedShard)
+                destination = self._process_dir / item.local_path.name
+                if destination != item.local_path:
+                    partial = self._process_dir / (
+                        f".{item.local_path.name}.{os.getpid()}.uploading"
+                    )
+                    shutil.copyfile(item.local_path, partial)
+                    os.replace(partial, destination)
+                    self._append_manifest(self._manifest, item.record)
+                    if self.delete_local_after_upload:
+                        item.local_path.unlink()
+                self._upload_queue.task_done()
+        except BaseException as exc:
+            self._async_error = exc
+
+    def close(self) -> None:
+        if self._closed or not self.async_enabled:
+            return
+        self._closed = True
+        assert self._pending_queue is not None
+        self._pending_queue.put(None)
+        if self._writer_thread is not None:
+            self._writer_thread.join()
+        if self._uploader_thread is not None:
+            self._uploader_thread.join()
+        self._check_async_error()
+        if self.expert_quota > 0 and self._manifest is not None:
+            for (layer_idx, phase), counts in sorted(self._expert_counts.items()):
+                values = counts.to("cpu").tolist()
+                self._append_manifest(
+                    self._manifest,
+                    {
+                        "record_type": "expert_quota",
+                        "format_version": 2,
+                        "created_unix_ns": time.time_ns(),
+                        "rank": self.rank,
+                        "layer": layer_idx,
+                        "phase": phase,
+                        "quota": self.expert_quota,
+                        "experts_at_quota": sum(
+                            value >= self.expert_quota for value in values
+                        ),
+                        "min_assignments": min(values),
+                        "max_assignments": max(values),
+                        "assignments": values,
+                    },
+                )
 
     def path_wants(self, point: str, layer_idx: int) -> bool:
         """Whether every TP rank must take the capture-compatible code path."""
@@ -200,14 +434,145 @@ class K3TensorCapture:
         """Whether this rank should serialize the requested capture point."""
         return self.rank_allowed and self.path_wants(point, layer_idx)
 
-    def _row_limit(self, point: str) -> int:
+    def _row_limit(self, point: str, phase: str = "all") -> int:
         env_name = "SGLANG_K3_CAPTURE_MAX_ROWS_" + point.upper().replace("-", "_")
-        return max(1, int(os.environ.get(env_name, str(self.default_max_rows))))
+        phase_name = f"{env_name}_{phase.upper()}"
+        value = os.environ.get(phase_name, os.environ.get(env_name, str(self.default_max_rows)))
+        return max(1, int(value))
 
-    def remaining_rows(self, point: str, layer_idx: int) -> int:
+    def remaining_rows(
+        self, point: str, layer_idx: int, phase: str | None = None
+    ) -> int:
         if not self.wants(point, layer_idx):
             return 0
-        return max(0, self._row_limit(point) - self._rows.get((point, layer_idx), 0))
+        resolved_phase = phase or str(self._context.get("phase", "all"))
+        key = (point, layer_idx, resolved_phase)
+        return max(
+            0,
+            self._row_limit(point, resolved_phase)
+            - self._rows_by_phase.get(key, 0),
+        )
+
+    @staticmethod
+    def _gpu_sample_indices(row_count: int, take: int, device: torch.device) -> torch.Tensor:
+        """Deterministic, position-stratified sampling performed on GPU."""
+        if take >= row_count:
+            return torch.arange(row_count, device=device, dtype=torch.long)
+        # One deterministic representative from each equal-width position bin.
+        return torch.div(
+            torch.arange(take, device=device, dtype=torch.long) * row_count
+            + row_count // (2 * take),
+            take,
+            rounding_mode="floor",
+        ).clamp_max_(row_count - 1)
+
+    def _expert_sample_indices(
+        self,
+        layer_idx: int,
+        phase: str,
+        topk_ids: torch.Tensor,
+        take: int,
+    ) -> torch.Tensor:
+        key = (layer_idx, phase)
+        counts = self._expert_counts.get(key)
+        if counts is None:
+            counts = torch.zeros(
+                self.num_experts, dtype=torch.int32, device=topk_ids.device
+            )
+            self._expert_counts[key] = counts
+        valid_ids = topk_ids.clamp(0, self.num_experts - 1).to(torch.long)
+        deficits = (self.expert_quota - counts).clamp_min_(0)
+        scores = deficits[valid_ids].amax(dim=1)
+        candidates = torch.nonzero(scores > 0, as_tuple=False).flatten()
+        if candidates.numel() > take:
+            chosen = self._gpu_sample_indices(
+                int(candidates.numel()), take, candidates.device
+            )
+            candidates = candidates.index_select(0, chosen)
+        selected_ids = valid_ids.index_select(0, candidates).flatten()
+        counts.add_(
+            torch.bincount(selected_ids, minlength=self.num_experts).to(counts.dtype)
+        ).clamp_max_(self.expert_quota)
+        return candidates
+
+    def _capture_async(
+        self,
+        point: str,
+        layer_idx: int,
+        present: Mapping[str, torch.Tensor],
+        metadata: Mapping[str, Any] | None,
+        once: bool,
+        row_count: int,
+        take: int,
+        event: int,
+        phase: str,
+        indices: torch.Tensor | None = None,
+    ) -> Path:
+        self._check_async_error()
+        first = next((value for value in present.values() if value.ndim > 0), None)
+        device = first.device if first is not None else torch.device("cpu")
+        if indices is None:
+            indices = self._gpu_sample_indices(row_count, take, device)
+
+        cpu_tensors: dict[str, torch.Tensor] = {}
+        tensor_meta: dict[str, Any] = {}
+        current_stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
+        copy_event = None
+        if self._copy_stream is not None and current_stream is not None:
+            self._copy_stream.wait_stream(current_stream)
+        stream_context = (
+            torch.cuda.stream(self._copy_stream)
+            if self._copy_stream is not None and current_stream is not None
+            else torch.no_grad()
+        )
+        with stream_context:
+            for name, value in present.items():
+                original_shape = list(value.shape)
+                original_stride = list(value.stride())
+                selected = (
+                    value.index_select(0, indices)
+                    if not once and value.ndim > 0 and value.shape[0] == row_count
+                    else value.detach().contiguous()
+                )
+                if selected.device.type == "cuda":
+                    selected = selected.contiguous()
+                    host = torch.empty_like(selected, device="cpu", pin_memory=True)
+                    host.copy_(selected, non_blocking=True)
+                    selected.record_stream(self._copy_stream)
+                else:
+                    host = selected.detach().contiguous().to("cpu").clone()
+                cpu_tensors[name] = host
+                tensor_meta[name] = {
+                    "shape": original_shape,
+                    "stride": original_stride,
+                    "saved_shape": list(host.shape),
+                    "dtype": str(value.dtype).removeprefix("torch."),
+                    "device": str(value.device),
+                    "saved_nbytes": host.numel() * host.element_size(),
+                }
+            if self._copy_stream is not None and current_stream is not None:
+                copy_event = torch.cuda.Event()
+                copy_event.record(self._copy_stream)
+
+        merged_metadata = {**self._context, **dict(metadata or {})}
+        record = {
+            "point": point,
+            "layer": layer_idx,
+            "event": event,
+            "rows": take,
+            "rows_total": self._rows[(point, layer_idx)],
+            "rows_phase_total": self._rows_by_phase[(point, layer_idx, phase)],
+            "phase": phase,
+            "rank": self.rank,
+            "local_rank": self.local_rank,
+            "tp_rank": self.tp_rank,
+            "tensors": tensor_meta,
+            "metadata": _jsonable(merged_metadata),
+        }
+        nbytes = sum(value.numel() * value.element_size() for value in cpu_tensors.values())
+        assert self._pending_queue is not None
+        self._pending_queue.put(_PendingCapture(copy_event, cpu_tensors, record, nbytes))
+        return Path(f"queued://rank-{self.rank}/{point}/l{layer_idx}/e{event}")
 
     def capture(
         self,
@@ -228,9 +593,12 @@ class K3TensorCapture:
             return None
         key = (point, layer_idx)
         with self._lock:
+            self._check_async_error()
             if once and self._events.get(key, 0) > 0:
                 return None
-            remaining = self.remaining_rows(point, layer_idx)
+            phase = self._phase(metadata)
+            phase_key = (point, layer_idx, phase)
+            remaining = self.remaining_rows(point, layer_idx, phase)
             if remaining <= 0:
                 return None
 
@@ -253,6 +621,41 @@ class K3TensorCapture:
             if take <= 0:
                 return None
 
+            indices = None
+            if (
+                self.async_enabled
+                and point == "expert_output"
+                and self.expert_quota > 0
+                and "topk_ids" in present
+            ):
+                indices = self._expert_sample_indices(
+                    layer_idx, phase, present["topk_ids"], take
+                )
+                take = int(indices.numel())
+                if take <= 0:
+                    return None
+
+            event = self._events.get(key, 0)
+            self._events[key] = event + 1
+            self._rows[key] = self._rows.get(key, 0) + take
+            self._rows_by_phase[phase_key] = (
+                self._rows_by_phase.get(phase_key, 0) + take
+            )
+
+            if self.async_enabled:
+                return self._capture_async(
+                    point,
+                    layer_idx,
+                    present,
+                    metadata,
+                    once,
+                    row_count,
+                    take,
+                    event,
+                    phase,
+                    indices,
+                )
+
             cpu_tensors: dict[str, torch.Tensor] = {}
             tensor_meta: dict[str, Any] = {}
             for name, value in present.items():
@@ -272,9 +675,6 @@ class K3TensorCapture:
                     "device": str(value.device),
                 }
 
-            event = self._events.get(key, 0)
-            self._events[key] = event + 1
-            self._rows[key] = self._rows.get(key, 0) + take
             assert self._process_dir is not None and self._manifest is not None
             stem = f"l{layer_idx:03d}-{point}-{event:06d}"
             final_path = self._process_dir / f"{stem}.safetensors"
@@ -325,6 +725,14 @@ def k3_capture_wants(point: str, layer_idx: int) -> bool:
 
 def k3_capture_remaining_rows(point: str, layer_idx: int) -> int:
     return get_k3_tensor_capture().remaining_rows(point, layer_idx)
+
+
+def k3_capture_set_forward_context(forward_batch: Any) -> None:
+    get_k3_tensor_capture().set_forward_context(forward_batch)
+
+
+def k3_capture_close() -> None:
+    get_k3_tensor_capture().close()
 
 
 def k3_capture(

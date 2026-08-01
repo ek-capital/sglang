@@ -35,6 +35,7 @@ def main() -> None:
     files = 0
     validated_shards = []
     validated_manifests = []
+    expert_quotas = []
     for manifest in sorted(args.capture_dir.glob("rank-*/manifest.jsonl")):
         validated_manifests.append(
             {
@@ -44,6 +45,34 @@ def main() -> None:
         )
         for line in manifest.read_text(encoding="utf-8").splitlines():
             record = json.loads(line)
+            if record.get("record_type") == "expert_quota":
+                expert_quotas.append(record)
+                continue
+            if record.get("record_type") == "shard":
+                shard = manifest.parent / record["file"]
+                if not shard.is_file():
+                    raise SystemExit(f"missing shard: {shard}")
+                if not args.skip_hash:
+                    digest = sha256_file(shard)
+                    if digest != record["sha256"]:
+                        raise SystemExit(f"hash mismatch: {shard}")
+                validated_shards.append(
+                    {
+                        "file": str(shard.relative_to(args.capture_dir)),
+                        "sha256": record["sha256"],
+                        "size": shard.stat().st_size,
+                    }
+                )
+                for entry in record["entries"]:
+                    point = entry["point"]
+                    rows[point] += int(entry["rows"])
+                    sizes[point] += sum(
+                        int(meta.get("saved_nbytes", 0))
+                        for meta in entry.get("tensors", {}).values()
+                    )
+                    layers[point].add(int(entry["layer"]))
+                    files += 1
+                continue
             if record.get("record_type") != "capture":
                 continue
             shard = manifest.parent / record["file"]
@@ -78,6 +107,15 @@ def main() -> None:
         )
         if missing and point not in {"lm_head"}:
             print(f"  missing layers: {missing}")
+    if expert_quotas:
+        complete = sum(
+            record["experts_at_quota"] == len(record["assignments"])
+            for record in expert_quotas
+        )
+        print(
+            f"expert quotas complete={complete}/{len(expert_quotas)} "
+            f"minimum={min(record['min_assignments'] for record in expert_quotas)}"
+        )
 
     if args.write_complete:
         entries = {"manifests": validated_manifests, "shards": validated_shards}

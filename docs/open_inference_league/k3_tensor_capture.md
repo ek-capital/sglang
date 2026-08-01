@@ -1,13 +1,13 @@
 # Kimi-K3 tensor capture
 
-The K3 capture path is inert unless `SGLANG_K3_CAPTURE_DIR` is set. It writes
-one atomic safetensors shard per captured invocation and a per-process
-`manifest.jsonl` containing tensor shapes, strides, dtypes, ranks, row counts,
-and SHA-256 digests.
-
-Capture is deliberately synchronous and is intended for one-off corpus
-generation, not throughput measurement. It clones tensors before SGLang can
-reuse symmetric buffers or recurrent state storage.
+The K3 capture path is inert unless `SGLANG_K3_CAPTURE_DIR` is set. Scalable
+capture samples deterministic position strata on GPU, copies selected rows on
+a dedicated CUDA stream into pinned host memory, packs entries into 128-512 MB
+safetensors shards on local NVMe, then uploads complete atomic shards to the
+persistent capture directory in a second background thread. The manifest
+retains tensor shapes, dtypes, row counts, phase/cache strata, TP rank and
+SHA-256 digests. The legacy synchronous writer remains available for smoke
+tests by leaving `SGLANG_K3_CAPTURE_ASYNC` unset.
 
 ## Canonical collection settings
 
@@ -33,6 +33,11 @@ export SGLANG_K3_CAPTURE_MAX_ROWS_ATTN_RES=128
 export SGLANG_K3_CAPTURE_MAX_ROWS_ATTN_RES_STATE=128
 export SGLANG_K3_CAPTURE_MAX_ROWS_ATTN_RES_STATIC=1
 export SGLANG_K3_CAPTURE_POINTS=all
+export SGLANG_K3_CAPTURE_ASYNC=1
+export SGLANG_K3_CAPTURE_LOCAL_DIR=/captures/k3-full
+export SGLANG_K3_CAPTURE_SHARD_MB=256
+export SGLANG_K3_CAPTURE_MAX_PENDING=8
+export SGLANG_K3_CAPTURE_DELETE_LOCAL_AFTER_UPLOAD=1
 
 python -m sglang.launch_server \
   --model-path moonshotai/Kimi-K3 \
@@ -70,14 +75,39 @@ snapshots as independent capture points. The TP-local
 pass adds exact recurrent KDA state before
 and after decode/extend kernel calls.
 
+For activation discovery, configure independent phase quotas. A practical
+TP8 rank-0 pass uses 8,192 prefill and 4,096 decode rows for layer streams,
+32,768 routing rows per phase, an expert-assignment quota of 256-512, 4,096
+KDA transitions per phase, and 8,192 MLA rows. `expert_output` stores the fused
+routed-expert result together with routed input and top-k IDs/weights; sampling
+prioritizes tokens assigned to experts whose quota is not yet satisfied.
+
+```bash
+export SGLANG_K3_CAPTURE_MAX_ROWS_LAYER_INPUT_PREFILL=8192
+export SGLANG_K3_CAPTURE_MAX_ROWS_LAYER_INPUT_DECODE=4096
+export SGLANG_K3_CAPTURE_MAX_ROWS_LAYER_OUTPUT_PREFILL=8192
+export SGLANG_K3_CAPTURE_MAX_ROWS_LAYER_OUTPUT_DECODE=4096
+export SGLANG_K3_CAPTURE_MAX_ROWS_ROUTING_PREFILL=32768
+export SGLANG_K3_CAPTURE_MAX_ROWS_ROUTING_DECODE=32768
+export SGLANG_K3_CAPTURE_MAX_ROWS_EXPERT_OUTPUT=65536
+export SGLANG_K3_CAPTURE_EXPERT_QUOTA=512
+export SGLANG_K3_CAPTURE_NUM_EXPERTS=896
+export SGLANG_K3_CAPTURE_MAX_ROWS_KDA_PREFILL=4096
+export SGLANG_K3_CAPTURE_MAX_ROWS_KDA_DECODE=4096
+export SGLANG_K3_CAPTURE_MAX_ROWS_KDA_STATE_EXTEND_PREFILL=4096
+export SGLANG_K3_CAPTURE_MAX_ROWS_KDA_STATE_DECODE_DECODE=4096
+export SGLANG_K3_CAPTURE_MAX_ROWS_MLA_GATE=8192
+export SGLANG_K3_CAPTURE_MAX_ROWS_MLA_LATENT=8192
+```
+
 ## Output layout
 
 ```text
 /data/k3-capture/
   rank-00000/
     manifest.jsonl
-    l000-layer_input-000000.safetensors
-    l000-kda-000000.safetensors
+    shard-000000.safetensors
+    shard-000001.safetensors
     ...
 ```
 

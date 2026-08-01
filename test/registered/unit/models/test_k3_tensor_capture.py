@@ -2,6 +2,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 from safetensors.torch import load_file
@@ -123,3 +124,89 @@ def test_capture_path_is_tp_uniform_but_writes_remain_rank_filtered(
     assert not capture.wants("routing", 1)
     assert capture.capture("routing", 1, {"x": torch.ones(1)}) is None
     assert not (tmp_path / "rank-00005").exists()
+
+
+def test_phase_quotas_are_independent(tmp_path, monkeypatch):
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_DIR", str(tmp_path))
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_MAX_ROWS_LAYER_INPUT_PREFILL", "3")
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_MAX_ROWS_LAYER_INPUT_DECODE", "2")
+    capture = K3TensorCapture()
+
+    capture.set_forward_context(
+        SimpleNamespace(
+            forward_mode="EXTEND",
+            extend_prefix_lens_cpu=[0],
+            extend_seq_lens_cpu=[10],
+            batch_size=1,
+        )
+    )
+    capture.capture("layer_input", 0, {"x": torch.arange(5).view(5, 1)})
+    assert capture.remaining_rows("layer_input", 0) == 0
+
+    capture.set_forward_context(
+        SimpleNamespace(
+            forward_mode="DECODE",
+            extend_prefix_lens_cpu=None,
+            extend_seq_lens_cpu=None,
+            batch_size=1,
+        )
+    )
+    assert capture.remaining_rows("layer_input", 0) == 2
+    capture.capture("layer_input", 0, {"x": torch.arange(5).view(5, 1)})
+    assert capture.remaining_rows("layer_input", 0) == 0
+
+
+def test_async_capture_packs_and_uploads_composite_shard(tmp_path, monkeypatch):
+    persistent = tmp_path / "persistent"
+    local = tmp_path / "local"
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_DIR", str(persistent))
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_LOCAL_DIR", str(local))
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_ASYNC", "1")
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_SHARD_MB", "0.001")
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_DELETE_LOCAL_AFTER_UPLOAD", "1")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    capture = K3TensorCapture()
+
+    tensor = torch.arange(4096, dtype=torch.float32).view(1024, 4)
+    capture.capture("layer_input", 0, {"hidden_states": tensor})
+    capture.capture("layer_output", 0, {"hidden_states": tensor + 1})
+    capture.close()
+
+    manifest = persistent / "rank-00000" / "manifest.jsonl"
+    records = [json.loads(line) for line in manifest.read_text().splitlines()]
+    shards = [record for record in records if record["record_type"] == "shard"]
+    assert shards
+    assert sum(len(record["entries"]) for record in shards) == 2
+    for record in shards:
+        path = manifest.parent / record["file"]
+        assert path.is_file()
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == record["sha256"]
+    assert not list((local / "rank-00000").glob("*.safetensors"))
+
+
+def test_expert_quota_sampling_records_assignment_coverage(tmp_path, monkeypatch):
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_DIR", str(tmp_path))
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_ASYNC", "1")
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_POINTS", "expert_output")
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_EXPERT_QUOTA", "2")
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_NUM_EXPERTS", "4")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    capture = K3TensorCapture()
+    topk_ids = torch.tensor([[0, 1], [2, 3], [0, 2], [1, 3]])
+    values = torch.arange(16, dtype=torch.float32).view(4, 4)
+
+    capture.capture(
+        "expert_output",
+        1,
+        {"topk_ids": topk_ids, "expert_output": values},
+        metadata={"phase": "prefill"},
+    )
+    capture.close()
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "rank-00000" / "manifest.jsonl").read_text().splitlines()
+    ]
+    quota = next(record for record in records if record["record_type"] == "expert_quota")
+    assert quota["experts_at_quota"] == 4
+    assert quota["min_assignments"] == 2

@@ -19,6 +19,7 @@ from sglang.srt.configs.kimi_k3 import KimiK3Config
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.debug_utils.k3_tensor_capture import (
     k3_capture,
+    k3_capture_set_forward_context,
     k3_capture_wants,
 )
 from sglang.srt.distributed import (
@@ -1026,6 +1027,16 @@ class KimiK3MoE(nn.Module):
             self._forward_mega_experts(routed_input, topk_output)
             if self._use_mega_moe
             else self.experts(routed_input, topk_output)
+        )
+        k3_capture(
+            "expert_output",
+            self.layer_idx,
+            {
+                "routed_input": routed_input,
+                "expert_output": expert_output,
+                "topk_ids": topk_output.topk_ids,
+                "topk_weights": topk_output.topk_weights,
+            },
         )
         latent = self._reduce_latent(expert_output)
         # up_proj is replicated, so the routed output is now fully reduced.
@@ -2573,6 +2584,7 @@ class KimiK3LinearModel(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        k3_capture_set_forward_context(forward_batch)
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
