@@ -11,6 +11,7 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
 from sglang.srt.debug_utils.k3_tensor_capture import (
     k3_capture,
     k3_capture_remaining_rows,
+    k3_capture_wants,
 )
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
@@ -679,7 +680,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         ssm_states = mamba_cache_params.temporal
 
-        capture_chunk_states = (
+        capture_chunk_states = k3_capture_wants(
+            "kda_state_extend", layer.layer_id
+        )
+        serialize_chunk_states = (
             k3_capture_remaining_rows("kda_state_extend", layer.layer_id) > 0
         )
 
@@ -787,7 +791,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 forward_batch, h, ssm_states, self.forward_metadata
             )
 
-        if capture_chunk_states:
+        if serialize_chunk_states:
             assert h is not None
             seq_lens = [int(length) for length in forward_batch.extend_seq_lens_cpu]
             final_states = ssm_states.index_select(0, cache_indices.to(torch.long))

@@ -29,7 +29,14 @@ export SGLANG_REPLAY_CAPTURE_MAX_GIB=4
 export SGLANG_K3_CAPTURE_RANKS=all
 export SGLANG_K3_CAPTURE_ASYNC=1
 export SGLANG_K3_CAPTURE_LOCAL_DIR=/local-nvme/run-001
+export SGLANG_K3_CAPTURE_ARM_FILE=/tmp/sglang-capture-arm
 ```
+
+Replay plans fail closed unless the arm sentinel is configured outside the
+capture destination. Create the sentinel only after startup and health checks;
+the health endpoint may execute a small prefill. Async replay plans also
+require an explicit local staging directory, so a FUSE/network destination
+cannot accidentally become the shard hot-write path.
 
 `SGLANG_REPLAY_CAPTURE_MAX_GIB` is a hard **per-rank** ceiling. The plan can
 set a lower default and per-operation row limits. TP collective plans require
@@ -54,8 +61,11 @@ python -m sglang.srt.debug_utils.replay_capture_validate /captures/run-001 \
   --minimum-bundles 20
 ```
 
-The validator checks schema completeness, minimum bundle counts, consistent
-world size, and that every collective sequence is present on every rank.
+The validator streams manifests, hashes shards with an ordered worker pool,
+requires each rank's transactional close marker, checks schema completeness,
+minimum bundle counts, consistent world size, and that every collective
+sequence is present on every rank. Use `--allow-open` only for inspecting an
+active run and `--skip-hashes` only for a quick non-integrity audit.
 
 ## Adding a model
 

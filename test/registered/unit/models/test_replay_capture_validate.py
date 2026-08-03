@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import hashlib
 import sys
 from pathlib import Path
 
@@ -69,3 +70,36 @@ def test_validator_accepts_complete_collective_and_minimum(tmp_path):
     )
     assert report["valid"]
     assert report["complete_bundles"]["collective.tp_residual"] == 2
+
+
+def test_validator_hashes_shards_and_requires_close_marker(tmp_path):
+    directory = tmp_path / "rank-00000"
+    directory.mkdir()
+    shard = directory / "shard-000000.safetensors"
+    shard.write_bytes(b"payload")
+    records = [
+        {"record_type": "run", "rank": 0, "world_size": 1},
+        {
+            "record_type": "shard",
+            "file": shard.name,
+            "sha256": hashlib.sha256(b"payload").hexdigest(),
+            "entries": [],
+        },
+    ]
+    (directory / "manifest.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in records)
+    )
+    (directory / "capture-close.json").write_text(
+        json.dumps({"rank": 0, "complete": True})
+    )
+
+    report = validator.validate_capture_root(
+        tmp_path, verify_sha256=True, require_closed=True, hash_workers=2
+    )
+    assert report["valid"]
+    assert report["hashed_shards"] == 1
+
+    shard.write_bytes(b"corrupt")
+    report = validator.validate_capture_root(tmp_path, verify_sha256=True)
+    assert not report["valid"]
+    assert "invalid shard" in report["errors"][0]

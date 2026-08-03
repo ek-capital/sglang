@@ -4784,4 +4784,13 @@ def run_scheduler_process(
             # Graceful path only: on the exception path the GPU may be wedged
             # and the synchronize() in destroy() could itself hang.
             if scheduler.gracefully_exit:
+                # Drain replay shards and atomically publish this rank's close
+                # audit before scheduler resources disappear.  Every TP
+                # scheduler executes this same finally path on coordinated
+                # SIGINT/SIGTERM shutdown.
+                from sglang.srt.debug_utils.k3_tensor_capture import (
+                    k3_capture_close,
+                )
+
+                k3_capture_close()
                 scheduler.release_host_resources()

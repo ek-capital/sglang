@@ -111,6 +111,7 @@ def test_collective_plan_requires_all_ranks(tmp_path, monkeypatch):
     )
     monkeypatch.setenv("SGLANG_REPLAY_CAPTURE_DIR", str(tmp_path / "capture"))
     monkeypatch.setenv("SGLANG_REPLAY_CAPTURE_PLAN", str(plan))
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_ARM_FILE", str(tmp_path / "ARMED"))
     monkeypatch.setenv("SGLANG_K3_CAPTURE_RANKS", "0")
     with pytest.raises(ValueError, match="RANKS=all"):
         K3TensorCapture()
@@ -271,17 +272,35 @@ def test_expert_quota_sampling_records_assignment_coverage(tmp_path, monkeypatch
     )
     capture.close()
 
-    records = [
-        json.loads(line)
-        for line in (tmp_path / "rank-00000" / "manifest.jsonl")
-        .read_text()
-        .splitlines()
-    ]
-    quota = next(
-        record for record in records if record["record_type"] == "expert_quota"
-    )
+    quota = json.loads(
+        (tmp_path / "rank-00000" / "capture-close.json").read_text()
+    )["expert_quotas"][0]
     assert quota["experts_at_quota"] == 4
     assert quota["min_assignments"] == 2
+
+
+def test_capture_rejects_nonempty_rank_directory(tmp_path, monkeypatch):
+    rank_dir = tmp_path / "rank-00000"
+    rank_dir.mkdir()
+    (rank_dir / "shard-000000.safetensors").write_bytes(b"old run")
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_DIR", str(tmp_path))
+
+    with pytest.raises(FileExistsError, match="already exists"):
+        K3TensorCapture()
+
+
+def test_async_plan_requires_explicit_local_staging(tmp_path, monkeypatch):
+    plan = tmp_path / "plan.json"
+    plan.write_text(json.dumps({"format_version": 1, "operations": []}))
+    monkeypatch.setenv("SGLANG_REPLAY_CAPTURE_DIR", str(tmp_path / "capture"))
+    monkeypatch.setenv("SGLANG_REPLAY_CAPTURE_PLAN", str(plan))
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_ARM_FILE", str(tmp_path / "ARMED"))
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_ASYNC", "1")
+    monkeypatch.delenv("SGLANG_K3_CAPTURE_LOCAL_DIR", raising=False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    with pytest.raises(ValueError, match="LOCAL_DIR"):
+        K3TensorCapture()
 
 
 def test_gpu_sampling_interleaves_tp_rank_strata(tmp_path, monkeypatch):
@@ -291,6 +310,41 @@ def test_gpu_sampling_interleaves_tp_rank_strata(tmp_path, monkeypatch):
     capture = K3TensorCapture()
     indices = capture._gpu_sample_indices(800, 10, torch.device("cpu"))
     assert indices.tolist() == [30, 110, 190, 270, 350, 430, 510, 590, 670, 750]
+
+
+def test_tp_split_row_limit_is_global_not_per_rank(tmp_path, monkeypatch):
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_DIR", str(tmp_path))
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_RANKS", "all")
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_SPLIT_ROWS_ACROSS_RANKS", "1")
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_MAX_ROWS", "10")
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_RANK", "3")
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_TP_RANK", "3")
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_TP_WORLD_SIZE", "8")
+
+    capture = K3TensorCapture()
+
+    assert capture._row_limit("layer_input") == 1
+
+
+def test_context_keeps_corpus_and_runtime_cache_strata_separate(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_DIR", str(tmp_path))
+    capture = K3TensorCapture()
+    capture.set_forward_context(
+        SimpleNamespace(
+            forward_mode="EXTEND",
+            extend_prefix_lens_cpu=[0],
+            extend_seq_lens_cpu=[64],
+            batch_size=1,
+            capture_corpus_metadata={"prefix_reuse_group": "group-a"},
+        )
+    )
+
+    assert capture._context["runtime_prefix_cache"] == "miss"
+    assert capture._context["corpus_metadata"] == {
+        "prefix_reuse_group": "group-a"
+    }
 
 
 def test_single_row_decode_calls_are_round_robined_across_ranks(tmp_path, monkeypatch):

@@ -94,6 +94,28 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
+    """Publish a small audit record without exposing a torn final file."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(value, handle, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+
+
+def _claim_new_directory(path: Path, label: str) -> None:
+    """Atomically claim a fresh directory instead of appending to an old run."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.mkdir()
+    except FileExistsError as exc:
+        raise FileExistsError(
+            f"{label} already exists: {path}; choose a fresh capture run directory"
+        ) from exc
+
+
 def _parallel_identity() -> tuple[int, int, int, int]:
     """Resolve ranks after SGLang has initialized torch.distributed.
 
@@ -148,6 +170,20 @@ def _parallel_identity() -> tuple[int, int, int, int]:
     return rank, local_rank, tp_rank, world_size
 
 
+def _tp_world_size(default: int) -> int:
+    explicit = os.environ.get("SGLANG_K3_CAPTURE_TP_WORLD_SIZE")
+    if explicit is not None:
+        return max(1, int(explicit))
+    try:
+        from sglang.srt.distributed.parallel_state import (
+            get_tensor_model_parallel_world_size,
+        )
+
+        return max(1, int(get_tensor_model_parallel_world_size()))
+    except (AssertionError, ImportError, RuntimeError):
+        return max(1, default)
+
+
 class ReplayTensorCapture:
     def __init__(self) -> None:
         plan_path = os.environ.get("SGLANG_REPLAY_CAPTURE_PLAN", "").strip()
@@ -173,7 +209,23 @@ class ReplayTensorCapture:
         self.root = Path(capture_dir) if capture_dir else None
         arm_file = os.environ.get("SGLANG_K3_CAPTURE_ARM_FILE", "").strip()
         self.arm_file = Path(arm_file) if arm_file else None
+        if self.enabled and plan_path and self.arm_file is None:
+            raise ValueError(
+                "replay capture starts unarmed; set SGLANG_K3_CAPTURE_ARM_FILE "
+                "to a local sentinel path"
+            )
+        if self.root is not None and self.arm_file is not None:
+            try:
+                self.arm_file.resolve().relative_to(self.root.resolve())
+            except ValueError:
+                pass
+            else:
+                raise ValueError(
+                    "SGLANG_K3_CAPTURE_ARM_FILE must not live under the capture "
+                    "destination; use a local sentinel such as /tmp/sglang-capture-arm"
+                )
         self.rank, self.local_rank, self.tp_rank, self.world_size = _parallel_identity()
+        self.tp_world_size = _tp_world_size(self.world_size)
         self.default_max_rows = max(
             1, int(os.environ.get("SGLANG_K3_CAPTURE_MAX_ROWS", "512"))
         )
@@ -228,6 +280,13 @@ class ReplayTensorCapture:
         self.async_enabled = self.enabled and os.environ.get(
             "SGLANG_K3_CAPTURE_ASYNC", "0"
         ).lower() in {"1", "true", "yes"}
+        local_dir = os.environ.get("SGLANG_K3_CAPTURE_LOCAL_DIR", "").strip()
+        if self.async_enabled and plan_path and not local_dir:
+            raise ValueError(
+                "async replay capture requires SGLANG_K3_CAPTURE_LOCAL_DIR "
+                "on local NVMe"
+            )
+        self._configured_local_root = Path(local_dir) if local_dir else self.root
         self.shard_target_bytes = int(
             float(os.environ.get("SGLANG_K3_CAPTURE_SHARD_MB", "256")) * 2**20
         )
@@ -252,12 +311,16 @@ class ReplayTensorCapture:
         ).lower() in {"1", "true", "yes"}
         self.split_rows_across_ranks = os.environ.get(
             "SGLANG_K3_CAPTURE_SPLIT_ROWS_ACROSS_RANKS", "0"
-        ).lower() in {"1", "true", "yes"}
+        ).lower() in {
+            "1",
+            "true",
+            "yes",
+        } or "collective.tp_residual" in plan_operations
 
         if self.enabled and self.rank_allowed:
             assert self.root is not None
             self._process_dir = self.root / f"rank-{self.rank:05d}"
-            self._process_dir.mkdir(parents=True, exist_ok=True)
+            _claim_new_directory(self._process_dir, "capture rank directory")
             self._manifest = self._process_dir / "manifest.jsonl"
             run_record = {
                 "record_type": "run",
@@ -283,11 +346,13 @@ class ReplayTensorCapture:
             with self._manifest.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(run_record, sort_keys=True) + "\n")
             if self.async_enabled:
-                local_root = Path(
-                    os.environ.get("SGLANG_K3_CAPTURE_LOCAL_DIR", str(self.root))
-                )
+                assert self._configured_local_root is not None
+                local_root = self._configured_local_root
                 self._local_process_dir = local_root / f"rank-{self.rank:05d}"
-                self._local_process_dir.mkdir(parents=True, exist_ok=True)
+                if self._local_process_dir != self._process_dir:
+                    _claim_new_directory(
+                        self._local_process_dir, "local staging rank directory"
+                    )
                 self._local_manifest = self._local_process_dir / "manifest.jsonl"
                 if self._local_manifest != self._manifest:
                     with self._local_manifest.open("a", encoding="utf-8") as handle:
@@ -324,14 +389,23 @@ class ReplayTensorCapture:
             if (bool(is_decode()) if callable(is_decode) else "decode" in mode)
             else "prefill"
         )
-        prefix_lens = getattr(forward_batch, "extend_prefix_lens_cpu", None) or []
-        seq_lens = getattr(forward_batch, "extend_seq_lens_cpu", None) or []
+        prefix_lens = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+        seq_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        prefix_lens = [] if prefix_lens is None else prefix_lens
+        seq_lens = [] if seq_lens is None else seq_lens
         max_prefix = max((int(x) for x in prefix_lens), default=0)
         max_seq = max((int(x) for x in seq_lens), default=0)
         self._context = {
             "phase": phase,
             "forward_mode": mode,
+            # Runtime state is deliberately distinct from corpus grouping.  A
+            # request tagged for prefix reuse can still be the group's first
+            # (cache-miss) member.
+            "runtime_prefix_cache": "hit" if max_prefix > 0 else "miss",
             "prefix_cache": "hit" if max_prefix > 0 else "miss",
+            "corpus_metadata": _jsonable(
+                getattr(forward_batch, "capture_corpus_metadata", None)
+            ),
             "max_prefix_len": max_prefix,
             "max_sequence_len": max_seq,
             "batch_size": int(getattr(forward_batch, "batch_size", 0) or 0),
@@ -447,26 +521,24 @@ class ReplayTensorCapture:
             self._async_error = exc
 
     def close(self) -> None:
-        if self._closed or not self.async_enabled:
+        if self._closed or not self.enabled or not self.rank_allowed:
             return
         self._closed = True
-        assert self._pending_queue is not None
-        self._pending_queue.put(None)
-        if self._writer_thread is not None:
-            self._writer_thread.join()
-        if self._uploader_thread is not None:
-            self._uploader_thread.join()
-        self._check_async_error()
-        if self.expert_quota > 0 and self._manifest is not None:
+        if self.async_enabled:
+            assert self._pending_queue is not None
+            self._pending_queue.put(None)
+            if self._writer_thread is not None:
+                self._writer_thread.join()
+            if self._uploader_thread is not None:
+                self._uploader_thread.join()
+            self._check_async_error()
+
+        quotas = []
+        if self.expert_quota > 0:
             for (layer_idx, phase), counts in sorted(self._expert_counts.items()):
                 values = counts.to("cpu").tolist()
-                self._append_manifest(
-                    self._manifest,
+                quotas.append(
                     {
-                        "record_type": "expert_quota",
-                        "format_version": 2,
-                        "created_unix_ns": time.time_ns(),
-                        "rank": self.rank,
                         "layer": layer_idx,
                         "phase": phase,
                         "quota": self.expert_quota,
@@ -476,8 +548,22 @@ class ReplayTensorCapture:
                         "min_assignments": min(values),
                         "max_assignments": max(values),
                         "assignments": values,
-                    },
+                    }
                 )
+        assert self._process_dir is not None
+        _atomic_json(
+            self._process_dir / "capture-close.json",
+            {
+                "record_type": "capture_close",
+                "format_version": 2,
+                "created_unix_ns": time.time_ns(),
+                "rank": self.rank,
+                "world_size": self.world_size,
+                "bytes_reserved": self._bytes_reserved,
+                "expert_quotas": quotas,
+                "complete": True,
+            },
+        )
 
     def path_wants(self, point: str, layer_idx: int) -> bool:
         """Whether every TP rank must take the capture-compatible code path."""
@@ -499,7 +585,15 @@ class ReplayTensorCapture:
         phase_name = f"{env_name}_{phase.upper()}"
         default = self._plan_row_limits.get(point, self.default_max_rows)
         value = os.environ.get(phase_name, os.environ.get(env_name, str(default)))
-        return max(1, int(value))
+        global_limit = max(1, int(value))
+        if self.split_rows_across_ranks and self.rank_allowed:
+            # The configured target is aggregate across TP, not per rank.
+            return max(
+                0,
+                (global_limit + self.tp_world_size - 1 - self.tp_rank)
+                // self.tp_world_size,
+            )
+        return global_limit
 
     def _fit_byte_budget(
         self,
@@ -547,10 +641,10 @@ class ReplayTensorCapture:
         """Deterministic GPU sampling, interleaved across TP-rank strata."""
         if take >= row_count:
             return torch.arange(row_count, device=device, dtype=torch.long)
-        denominator = take * self.world_size
+        denominator = take * self.tp_world_size
         strata = (
-            torch.arange(take, device=device, dtype=torch.long) * self.world_size
-            + self.rank
+            torch.arange(take, device=device, dtype=torch.long) * self.tp_world_size
+            + self.tp_rank
         )
         return torch.div(
             strata * row_count + denominator // 2,
@@ -620,7 +714,10 @@ class ReplayTensorCapture:
             selected = (
                 value.index_select(0, indices)
                 if not once and value.ndim > 0 and value.shape[0] == row_count
-                else value.detach().contiguous()
+                # contiguous() may alias an already-contiguous workspace.  A
+                # real producer-stream clone is required before the model can
+                # reuse it while the copy stream is still transferring.
+                else value.detach().contiguous().clone()
             )
             prepared[name] = selected.contiguous()
         if self._copy_stream is not None and current_stream is not None:
@@ -725,13 +822,13 @@ class ReplayTensorCapture:
             )
             take = min(row_count, remaining)
             if self.async_enabled and self.split_rows_across_ranks and not once:
-                if row_count < self.world_size:
-                    if call_index % self.world_size != self.rank:
+                if row_count < self.tp_world_size:
+                    if call_index % self.tp_world_size != self.tp_rank:
                         return None
                 else:
                     take = min(
                         take,
-                        (row_count + self.world_size - 1) // self.world_size,
+                        (row_count + self.tp_world_size - 1) // self.tp_world_size,
                     )
             if take <= 0:
                 return None
