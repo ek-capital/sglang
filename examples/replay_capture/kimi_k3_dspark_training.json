@@ -1,0 +1,11 @@
+{
+  "format_version": 1,
+  "model_family": "kimi_k3",
+  "max_gib_per_rank": 64,
+  "operations": [
+    "speculative.dspark_training_window"
+  ],
+  "max_rows_per_operation": {
+    "speculative.dspark_training_window": 256
+  }
+}

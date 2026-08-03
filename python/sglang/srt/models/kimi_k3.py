@@ -7,6 +7,7 @@
 #   - Full-rank KDA gate (use_full_rank_gate)
 
 import logging
+import os
 from collections.abc import Iterable
 from functools import cached_property
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -21,7 +22,9 @@ from sglang.srt.debug_utils.k3_tensor_capture import (
     k3_capture_wants,
 )
 from sglang.srt.debug_utils.replay_capture import (
+    build_dspark_training_window,
     replay_capture_bundle,
+    replay_capture_configured,
     replay_capture_path_wants,
     replay_capture_wants,
 )
@@ -527,10 +530,7 @@ class KimiK3MoE(nn.Module):
         # (e.g. marlin) require a dense buffer.
         self._moe_front_needs_contiguous = (
             not get_moe_runner_backend().is_flashinfer_mxfp4()
-            or (
-                quant_config is not None
-                and quant_config.get_name() == "kimi_k3_w2a16"
-            )
+            or (quant_config is not None and quant_config.get_name() == "kimi_k3_w2a16")
         )
 
         # Defer the trtllm-gen finalize (top-k weighted unpermute) out of the
@@ -542,10 +542,7 @@ class KimiK3MoE(nn.Module):
         self._defer_moe_finalize = (
             get_moe_runner_backend().is_flashinfer_mxfp4()
             and config.hidden_act == "situ"
-            and (
-                quant_config is None
-                or quant_config.get_name() != "kimi_k3_w2a16"
-            )
+            and (quant_config is None or quant_config.get_name() != "kimi_k3_w2a16")
         )
 
         # Shared experts (operate in original hidden_size space).
@@ -930,9 +927,10 @@ class KimiK3MoE(nn.Module):
     def _reduce_latent(self, latent: torch.Tensor) -> torch.Tensor:
         """Unfused-front latent tail: TP-partial routed sums must be reduced
         in latent space BEFORE the RMSNorm (sum(norm(x_i)) != norm(sum(x_i)))."""
-        if not self._routed_needs_reduce:
-            return self._latent_norm(latent)
-        return self._latent_norm(tensor_model_parallel_all_reduce(latent))
+        with semantic_range("moe.latent_reduce_norm", layer=self.layer_idx):
+            if not self._routed_needs_reduce:
+                return self._latent_norm(latent)
+            return self._latent_norm(tensor_model_parallel_all_reduce(latent))
 
     def _forward_unfused(
         self, hidden_states: torch.Tensor, *, prefix_sum: Optional[torch.Tensor]
@@ -955,13 +953,14 @@ class KimiK3MoE(nn.Module):
             nonlocal shared_output, shared_event
             if self.shared_experts is None or hidden_states.shape[0] == 0:
                 return
-            if self._sbo_shared_overlap:
-                self.alt_stream.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(self.alt_stream):
+            with semantic_range("moe.shared_experts", layer=self.layer_idx):
+                if self._sbo_shared_overlap:
+                    self.alt_stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(self.alt_stream):
+                        shared_output = self.shared_experts(hidden_states)
+                        shared_event = self.alt_stream.record_event()
+                else:
                     shared_output = self.shared_experts(hidden_states)
-                    shared_event = self.alt_stream.record_event()
-            else:
-                shared_output = self.shared_experts(hidden_states)
 
         # Front: gate + TopK (+ latent down-proj when the merged front covers it).
         # The gate and the latent down-proj read the same hidden_states, so the
@@ -972,24 +971,26 @@ class KimiK3MoE(nn.Module):
         # logits. Corpus collection takes the semantically identical unfused
         # projections so the replay artifact contains logits, routed input,
         # and the resulting top-k decision together.
-        routed_input = None if capture_routing else self._ep_front(hidden_states)
-        if routed_input is None and not capture_routing:
-            routed_input = self._ep_front_overlap(hidden_states)
-        topk_output = None
-        router_logits = None
-        if routed_input is not None:
-            topk_output, routed_input = routed_input
-        else:
-            # MoEGate produces fp32 router logits on CUDA (via linear_bf16_fp32
-            # or dsv3_router_gemm); non-CUDA falls back to F.linear (bf16). The
-            # fp32 logits reach the radix router from moe_fused_gate.
-            router_logits = self.gate(hidden_states)
-            topk_output = self.topk(hidden_states, router_logits)
+        with semantic_range("moe.front_route", layer=self.layer_idx, fused=False):
+            routed_input = None if capture_routing else self._ep_front(hidden_states)
+            if routed_input is None and not capture_routing:
+                routed_input = self._ep_front_overlap(hidden_states)
+            topk_output = None
+            router_logits = None
+            if routed_input is not None:
+                topk_output, routed_input = routed_input
+            else:
+                # MoEGate produces fp32 router logits on CUDA (via linear_bf16_fp32
+                # or dsv3_router_gemm); non-CUDA falls back to F.linear (bf16). The
+                # fp32 logits reach the radix router from moe_fused_gate.
+                router_logits = self.gate(hidden_states)
+                topk_output = self.topk(hidden_states, router_logits)
 
         issue_shared()
 
         if not self.use_latent_moe:
-            expert_output = self.experts(hidden_states, topk_output)
+            with semantic_range("moe.routed_experts", layer=self.layer_idx):
+                expert_output = self.experts(hidden_states, topk_output)
             if shared_event is not None:
                 torch.cuda.current_stream().wait_event(shared_event)
             if shared_output is not None:
@@ -1038,11 +1039,12 @@ class KimiK3MoE(nn.Module):
         capture_topk_weights = (
             topk_output.topk_weights.clone() if capture_expert_output else None
         )
-        expert_output = (
-            self._forward_mega_experts(routed_input, topk_output)
-            if self._use_mega_moe
-            else self.experts(routed_input, topk_output)
-        )
+        with semantic_range("moe.routed_experts", layer=self.layer_idx):
+            expert_output = (
+                self._forward_mega_experts(routed_input, topk_output)
+                if self._use_mega_moe
+                else self.experts(routed_input, topk_output)
+            )
         k3_capture(
             "expert_output",
             self.layer_idx,
@@ -1055,7 +1057,8 @@ class KimiK3MoE(nn.Module):
         )
         latent = self._reduce_latent(expert_output)
         # up_proj is replicated, so the routed output is now fully reduced.
-        out, _ = self.routed_expert_up_proj(latent)
+        with semantic_range("moe.up_projection", layer=self.layer_idx):
+            out, _ = self.routed_expert_up_proj(latent)
         if shared_event is not None:
             # SBO join: as late as possible, so the side-stream shared experts
             # get the whole routed a2a + latent tail to hide under.
@@ -1065,7 +1068,8 @@ class KimiK3MoE(nn.Module):
             # ones need the partial-sum reduction.
             if self.tp_size > 1 and not self._shared_experts_tp1:
                 shared_output = tensor_model_parallel_all_reduce(shared_output)
-            tail_output = _add3(out, shared_output, prefix_sum)
+            with semantic_range("moe.tail", layer=self.layer_idx):
+                tail_output = _add3(out, shared_output, prefix_sum)
             if replay_capture_wants("moe.shared_mlp", self.layer_idx):
                 replay_capture_bundle(
                     "moe.shared_mlp",
@@ -1093,7 +1097,8 @@ class KimiK3MoE(nn.Module):
                     metadata={"pending_residual_present": prefix_sum is not None},
                 )
             return tail_output
-        tail_output = out if prefix_sum is None else out + prefix_sum
+        with semantic_range("moe.tail", layer=self.layer_idx):
+            tail_output = out if prefix_sum is None else out + prefix_sum
         return tail_output
 
     @cached_property
@@ -1116,9 +1121,10 @@ class KimiK3MoE(nn.Module):
         if self._route_quant_fuse_eligible:
             route_quant_handoff.stage(routed_input)
         try:
-            topk_output = self.topk(hidden_states, router_logits)
-            with zero_copy_context.set_moe_output(latent):
-                expert_output = self.experts(routed_input, topk_output)
+            with semantic_range("moe.routed_experts", layer=self.layer_idx):
+                topk_output = self.topk(hidden_states, router_logits)
+                with zero_copy_context.set_moe_output(latent):
+                    expert_output = self.experts(routed_input, topk_output)
         finally:
             route_quant_handoff.clear()
         if expert_output.data_ptr() != latent.data_ptr():
@@ -1144,11 +1150,12 @@ class KimiK3MoE(nn.Module):
                 shared.down_proj.weight, torch.Tensor
             )
         assert shared is not None
-        _k3_bf16_gemm(
-            shared.act_fn(gate_up),
-            shared.down_proj.weight,
-            out=shared_output,
-        )
+        with semantic_range("moe.shared_experts", layer=self.layer_idx):
+            _k3_bf16_gemm(
+                shared.act_fn(gate_up),
+                shared.down_proj.weight,
+                out=shared_output,
+            )
 
     def _get_fused_norm_params(self) -> tuple[torch.Tensor, float]:
         norm = self.routed_expert_norm
@@ -1176,10 +1183,11 @@ class KimiK3MoE(nn.Module):
             )
 
         num_tokens, hidden_size = hidden_states.shape
-        fused = _k3_bf16_gemm(hidden_states, self._front_w)
-        gate_up, router_logits, routed_input = torch.split(
-            fused, self._front_sizes, dim=-1
-        )
+        with semantic_range("moe.front_route", layer=self.layer_idx, fused=True):
+            fused = _k3_bf16_gemm(hidden_states, self._front_w)
+            gate_up, router_logits, routed_input = torch.split(
+                fused, self._front_sizes, dim=-1
+            )
         if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
             router_logits = router_logits.contiguous()
         if num_tokens > 1 and self._moe_front_needs_contiguous:
@@ -1221,7 +1229,12 @@ class KimiK3MoE(nn.Module):
                 self._forward_shared(gate_up, shared_output)
                 # low-SM pull so the side-stream AR leaves the SMs to the
                 # routed GEMMs it overlaps (K3 dims are fixed; tuned here)
-                k3_ar_fusion.all_reduce_low_sm(shared_output, num_blocks=4, unroll=8)
+                with semantic_range(
+                    "moe.collective", layer=self.layer_idx, branch="shared"
+                ):
+                    k3_ar_fusion.all_reduce_low_sm(
+                        shared_output, num_blocks=4, unroll=8
+                    )
             current_stream.wait_stream(self.alt_stream)
             # NOTE: the latent AR must stay serialized after the shared AR
             # (both reuse the v2 pull semaphores; concurrent calls would
@@ -1230,22 +1243,31 @@ class KimiK3MoE(nn.Module):
                 # finalize folded into the push AR's staging pass; the norm
                 # covers every latent row
                 fused_norm = True
-                k3_ar_fusion.finalize_all_reduce_push_norm(
-                    latent,
-                    deferred.gemm2_out,
-                    deferred.expanded_idx_to_permuted_idx,
-                    deferred.expert_weights,
-                    *self._get_fused_norm_params(),
-                )
+                with semantic_range(
+                    "moe.collective", layer=self.layer_idx, branch="routed"
+                ):
+                    k3_ar_fusion.finalize_all_reduce_push_norm(
+                        latent,
+                        deferred.gemm2_out,
+                        deferred.expanded_idx_to_permuted_idx,
+                        deferred.expert_weights,
+                        *self._get_fused_norm_params(),
+                    )
             elif self.fuse_ar_norm:
                 fused_norm = True
-                k3_ar_fusion.all_reduce_norm(
-                    latent.view(-1, self.moe_hidden_size),
-                    *self._get_fused_norm_params(),
-                    num_tokens=num_tokens,
-                )
+                with semantic_range(
+                    "moe.collective", layer=self.layer_idx, branch="routed"
+                ):
+                    k3_ar_fusion.all_reduce_norm(
+                        latent.view(-1, self.moe_hidden_size),
+                        *self._get_fused_norm_params(),
+                        num_tokens=num_tokens,
+                    )
             else:
-                k3_ar_fusion.all_reduce(latent)
+                with semantic_range(
+                    "moe.collective", layer=self.layer_idx, branch="routed"
+                ):
+                    k3_ar_fusion.all_reduce(latent)
             # the gemm_ag tail wants the normed latent straight out of the
             # fused-norm AR (its GEMV chains on it via PDL)
             if (
@@ -1253,38 +1275,54 @@ class KimiK3MoE(nn.Module):
                 and self._gemm_ag_up_eligible
                 and k3_ar_fusion.gemm_ag_up_fits(num_tokens)
             ):
-                return k3_ar_fusion.gemm_ag_up_proj(
-                    latent,
-                    self.routed_expert_up_proj.weight,  # type: ignore
-                    shared_output,
-                    prefix_sum,
-                )
+                with semantic_range("moe.tail", layer=self.layer_idx, fused=True):
+                    with semantic_range(
+                        "moe.up_projection", layer=self.layer_idx, fused=True
+                    ):
+                        return k3_ar_fusion.gemm_ag_up_proj(
+                            latent,
+                            self.routed_expert_up_proj.weight,  # type: ignore
+                            shared_output,
+                            prefix_sum,
+                        )
         else:  # single collective over the flat [latent | shared] pair
             self._forward_shared(gate_up, shared_output)
             self._forward_routed(hidden_states, router_logits, routed_input, latent)
             if self.fuse_ar_norm and k3_ar_fusion.enabled():
                 fused_norm = True
-                k3_ar_fusion.all_reduce_norm(
-                    buf.view(-1, k3_ar_fusion.NORM_DIM),
-                    *self._get_fused_norm_params(),
-                    num_tokens=num_tokens,
-                )
+                with semantic_range(
+                    "moe.collective", layer=self.layer_idx, branch="combined"
+                ):
+                    k3_ar_fusion.all_reduce_norm(
+                        buf.view(-1, k3_ar_fusion.NORM_DIM),
+                        *self._get_fused_norm_params(),
+                        num_tokens=num_tokens,
+                    )
             elif k3_ar_fusion.enabled():
-                k3_ar_fusion.all_reduce(buf)
+                with semantic_range(
+                    "moe.collective", layer=self.layer_idx, branch="combined"
+                ):
+                    k3_ar_fusion.all_reduce(buf)
             else:
-                buf = tensor_model_parallel_all_reduce(buf)
+                with semantic_range(
+                    "moe.collective", layer=self.layer_idx, branch="combined"
+                ):
+                    buf = tensor_model_parallel_all_reduce(buf)
 
         latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
         shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
-        if not fused_norm:
-            latent = self._latent_norm(latent)
-        out, _ = self.routed_expert_up_proj(latent)
+        with semantic_range("moe.latent_reduce_norm", layer=self.layer_idx):
+            if not fused_norm:
+                latent = self._latent_norm(latent)
+        with semantic_range("moe.up_projection", layer=self.layer_idx):
+            out, _ = self.routed_expert_up_proj(latent)
 
         # prefetch_bc: b (shared_output) was produced by the all-reduce and
         # c (prefix_sum) even earlier; the AR is a plain launch (full
         # barrier), so both are complete once the norm / up_proj GEMM chain
         # starts — only `a`'s producer can still be in flight at PDL entry.
-        return _add3(out, shared_output, prefix_sum, prefetch_bc=True)
+        with semantic_range("moe.tail", layer=self.layer_idx):
+            return _add3(out, shared_output, prefix_sum, prefetch_bc=True)
 
     def forward(
         self,
@@ -1321,9 +1359,7 @@ class KimiK3MoE(nn.Module):
                 hidden_states.shape[0] > 0
                 and self._eligible_for_fused_front
                 and not k3_capture_wants("routing", self.layer_idx)
-                and not replay_capture_path_wants(
-                    "moe.shared_mlp", self.layer_idx
-                )
+                and not replay_capture_path_wants("moe.shared_mlp", self.layer_idx)
                 and not replay_capture_path_wants("moe.tail", self.layer_idx)
             ):
                 out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
@@ -1788,14 +1824,15 @@ class KimiK3DeltaAttention(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
-        if self.do_fuse_qkvbfg:
-            mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
-                hidden_states
-            )
-        else:
-            mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg(
-                hidden_states
-            )
+        with semantic_range("attention.kda.projections", layer=self.layer_idx):
+            if self.do_fuse_qkvbfg:
+                mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
+                    hidden_states
+                )
+            else:
+                mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg(
+                    hidden_states
+                )
 
         if not forward_batch.forward_mode.is_decode():
             forget_gate = forget_gate.unflatten(-1, (-1, self.head_dim))
@@ -1833,25 +1870,32 @@ class KimiK3DeltaAttention(nn.Module):
             self.attn._k3_onorm_gate = g_proj_states
             self.attn._k3_onorm_consumed = False
 
-        core_attn_out = self.attn(
-            forward_batch,
-            mixed_qkv=mixed_qkv,
-            a=forget_gate,
-            b=beta,
-        )
+        with semantic_range(
+            "attention.kda.recurrence",
+            layer=self.layer_idx,
+            phase=getattr(forward_batch.forward_mode, "name", "unknown"),
+        ):
+            core_attn_out = self.attn(
+                forward_batch,
+                mixed_qkv=mixed_qkv,
+                a=forget_gate,
+                b=beta,
+            )
 
         if fused_onorm:
             self.attn._k3_onorm_gate = None
             fused_onorm = self.attn._k3_onorm_consumed
         if not fused_onorm:
-            norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))
-            core_attn_out = self.o_norm(core_attn_out, norm_gate)
+            with semantic_range("attention.kda.output_norm", layer=self.layer_idx):
+                norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))
+                core_attn_out = self.o_norm(core_attn_out, norm_gate)
         core_attn_out = core_attn_out.squeeze(0).flatten(-2)
-        if self.all_reduce_fusion:
-            out = _k3_symm_o_proj_out(self.o_proj, core_attn_out)
-            partial, _ = self.o_proj(core_attn_out, output_tensor=out)
-            return partial
-        return self.o_proj(core_attn_out)[0]
+        with semantic_range("attention.kda.output_projection", layer=self.layer_idx):
+            if self.all_reduce_fusion:
+                out = _k3_symm_o_proj_out(self.o_proj, core_attn_out)
+                partial, _ = self.o_proj(core_attn_out, output_tensor=out)
+                return partial
+            return self.o_proj(core_attn_out)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -2350,9 +2394,7 @@ class KimiK3DecoderLayer(nn.Module):
             },
         )
         attention_kind = (
-            "attention.mla"
-            if qkv_latent_func is not None
-            else "attention.kda"
+            "attention.mla" if qkv_latent_func is not None else "attention.kda"
         )
         with semantic_range(
             attention_kind,
@@ -2887,6 +2929,32 @@ class KimiK3LinearForCausalLM(nn.Module):
         logit_scale = getattr(config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(config=config, logit_scale=logit_scale)
         self.capture_aux_hidden_states = False
+        self._dspark_training_capture_forward_id = 0
+        if replay_capture_configured("speculative.dspark_training_window", -1):
+            raw_layer_ids = os.environ.get(
+                "SGLANG_DSPARK_CAPTURE_TARGET_LAYER_IDS", ""
+            ).strip()
+            if not raw_layer_ids:
+                raise ValueError(
+                    "DSpark training capture requires "
+                    "SGLANG_DSPARK_CAPTURE_TARGET_LAYER_IDS (for example "
+                    "7,23,51,67,83); layer order is part of the checkpoint ABI."
+                )
+            target_layer_ids = [
+                int(value.strip())
+                for value in raw_layer_ids.split(",")
+                if value.strip()
+            ]
+            if target_layer_ids != sorted(set(target_layer_ids)):
+                raise ValueError(
+                    "SGLANG_DSPARK_CAPTURE_TARGET_LAYER_IDS must be unique and "
+                    "strictly increasing to match concatenated hidden-state order"
+                )
+            if not target_layer_ids or target_layer_ids[-1] >= config.num_hidden_layers:
+                raise ValueError(
+                    "DSpark capture target layers must be within the K3 layer range"
+                )
+            self.set_dspark_layers_to_capture(target_layer_ids)
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -2923,6 +2991,52 @@ class KimiK3LinearForCausalLM(nn.Module):
             aux_hidden_states = None
             if self.capture_aux_hidden_states:
                 hidden_states, aux_hidden_states = hidden_states
+            mode = forward_batch.forward_mode
+            if (
+                aux_hidden_states
+                and replay_capture_wants("speculative.dspark_training_window", -1)
+                and callable(getattr(mode, "is_extend", None))
+                and mode.is_extend()
+            ):
+                seq_lens = forward_batch.extend_seq_lens_cpu
+                prefix_lens = forward_batch.extend_prefix_lens_cpu
+                if seq_lens is None or prefix_lens is None:
+                    raise ValueError(
+                        "DSpark training capture requires CPU sequence-length mirrors"
+                    )
+                if len(seq_lens) != len(prefix_lens):
+                    raise ValueError(
+                        "DSpark training capture sequence/prefix counts disagree"
+                    )
+                captured_lengths = [
+                    int(seq_len) - int(prefix_len)
+                    for seq_len, prefix_len in zip(seq_lens, prefix_lens)
+                ]
+                target_layer_ids = list(self.model.dspark_layers_to_capture or [])
+                training_tensors = build_dspark_training_window(
+                    input_ids=input_ids,
+                    positions=positions,
+                    target_hidden=torch.cat(aux_hidden_states, dim=-1),
+                    target_layer_ids=target_layer_ids,
+                    sequence_lengths=captured_lengths,
+                    request_pool_indices=forward_batch.req_pool_indices,
+                )
+                replay_capture_bundle(
+                    "speculative.dspark_training_window",
+                    -1,
+                    training_tensors,
+                    metadata={
+                        "forward_id": self._dspark_training_capture_forward_id,
+                        "request_ids": list(forward_batch.rids or []),
+                        "target_layer_ids": target_layer_ids,
+                        "target_hidden_layout": "concat_last_dim",
+                        "token_count": int(input_ids.numel()),
+                        "sequence_count": len(captured_lengths),
+                        "label_shift": 1,
+                        "terminal_label_id": -100,
+                    },
+                )
+                self._dspark_training_capture_forward_id += 1
             result = self.logits_processor(
                 input_ids,
                 hidden_states,

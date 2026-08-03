@@ -134,25 +134,29 @@ def _parallel_identity() -> tuple[int, int, int, int]:
     rank = (
         int(explicit_rank)
         if explicit_rank is not None
-        else torch.distributed.get_rank()
-        if dist_ready
-        else int(os.environ.get("RANK", "0"))
+        else (
+            torch.distributed.get_rank()
+            if dist_ready
+            else int(os.environ.get("RANK", "0"))
+        )
     )
     world_size = (
         int(explicit_world_size)
         if explicit_world_size is not None
-        else torch.distributed.get_world_size()
-        if dist_ready
-        else int(os.environ.get("WORLD_SIZE", "1"))
+        else (
+            torch.distributed.get_world_size()
+            if dist_ready
+            else int(os.environ.get("WORLD_SIZE", "1"))
+        )
     )
     local_rank = (
         int(explicit_local_rank)
         if explicit_local_rank is not None
-        else int(os.environ["LOCAL_RANK"])
-        if "LOCAL_RANK" in os.environ
-        else torch.cuda.current_device()
-        if torch.cuda.is_available()
-        else rank
+        else (
+            int(os.environ["LOCAL_RANK"])
+            if "LOCAL_RANK" in os.environ
+            else torch.cuda.current_device() if torch.cuda.is_available() else rank
+        )
     )
 
     if explicit_tp_rank is not None:
@@ -240,27 +244,46 @@ class ReplayTensorCapture:
         self.max_bytes = max(1, int(max_gib * 2**30))
         self._bytes_reserved = 0
         self.layers = _parse_layers(os.environ.get("SGLANG_K3_CAPTURE_LAYERS", "all"))
+        plan_phases = plan.get("phases", "all")
+        if isinstance(plan_phases, list):
+            plan_phases = ",".join(str(phase) for phase in plan_phases)
+        raw_phases = (
+            os.environ.get("SGLANG_K3_CAPTURE_PHASES", str(plan_phases)).strip().lower()
+        )
+        self.phases = (
+            None
+            if not raw_phases or raw_phases == "all"
+            else {phase.strip() for phase in raw_phases.split(",") if phase.strip()}
+        )
         plan_operations = plan.get("operations", [])
-        raw_points = (
+        plan_points = plan.get("points", [])
+        configured_points = [f"bundle.{name}" for name in plan_operations]
+        configured_points.extend(str(name) for name in plan_points)
+        extra_points = (
             os.environ.get("SGLANG_REPLAY_CAPTURE_POINTS")
-            or (
-                ",".join(f"bundle.{name}" for name in plan_operations)
-                if plan_operations
-                else None
-            )
-            or os.environ.get("SGLANG_K3_CAPTURE_POINTS", "all")
+            or os.environ.get("SGLANG_K3_CAPTURE_POINTS", "")
         ).strip()
+        if extra_points:
+            configured_points.extend(
+                point.strip() for point in extra_points.split(",") if point.strip()
+            )
+        raw_points = ",".join(configured_points) if configured_points else "all"
         self.all_points = not raw_points or raw_points.lower() == "all"
         self.points = (
             set(_DEFAULT_POINTS)
             if self.all_points
             else {point.strip() for point in raw_points.split(",") if point.strip()}
         )
-        rank_filter = os.environ.get("SGLANG_K3_CAPTURE_RANKS", "0").strip().lower()
-        if "collective.tp_residual" in plan_operations and rank_filter != "all":
-            raise ValueError(
-                "collective replay capture requires SGLANG_K3_CAPTURE_RANKS=all"
-            )
+        rank_filter = (
+            os.environ.get("SGLANG_K3_CAPTURE_RANKS", str(plan.get("ranks", "0")))
+            .strip()
+            .lower()
+        )
+        if (
+            "collective.tp_residual" in plan_operations
+            or bool(plan.get("require_all_ranks", False))
+        ) and rank_filter != "all":
+            raise ValueError("this replay plan requires SGLANG_K3_CAPTURE_RANKS=all")
         self.rank_allowed = rank_filter == "all" or self.rank in {
             int(item) for item in rank_filter.split(",") if item.strip()
         }
@@ -269,6 +292,12 @@ class ReplayTensorCapture:
             f"bundle.{name}": int(limit)
             for name, limit in plan.get("max_rows_per_operation", {}).items()
         }
+        self._plan_row_limits.update(
+            {
+                str(name): int(limit)
+                for name, limit in plan.get("max_rows_per_point", {}).items()
+            }
+        )
         self._rows_by_phase: dict[tuple[str, int, str], int] = {}
         self._events: dict[tuple[str, int], int] = {}
         self._calls: dict[tuple[str, int], int] = {}
@@ -309,13 +338,15 @@ class ReplayTensorCapture:
         self.delete_local_after_upload = os.environ.get(
             "SGLANG_K3_CAPTURE_DELETE_LOCAL_AFTER_UPLOAD", "1"
         ).lower() in {"1", "true", "yes"}
-        self.split_rows_across_ranks = os.environ.get(
-            "SGLANG_K3_CAPTURE_SPLIT_ROWS_ACROSS_RANKS", "0"
-        ).lower() in {
-            "1",
-            "true",
-            "yes",
-        } or "collective.tp_residual" in plan_operations
+        self.split_rows_across_ranks = (
+            os.environ.get("SGLANG_K3_CAPTURE_SPLIT_ROWS_ACROSS_RANKS", "0").lower()
+            in {
+                "1",
+                "true",
+                "yes",
+            }
+            or "collective.tp_residual" in plan_operations
+        )
 
         if self.enabled and self.rank_allowed:
             assert self.root is not None
@@ -332,11 +363,21 @@ class ReplayTensorCapture:
                 "world_size": self.world_size,
                 "run_id": os.environ.get("SGLANG_K3_CAPTURE_RUN_ID"),
                 "model_revision": os.environ.get("SGLANG_K3_CAPTURE_MODEL_REVISION"),
+                "draft_model_revision": os.environ.get(
+                    "SGLANG_DSPARK_CAPTURE_DRAFT_REVISION"
+                ),
+                "tokenizer_revision": os.environ.get(
+                    "SGLANG_DSPARK_CAPTURE_TOKENIZER_REVISION"
+                ),
+                "chat_template_sha256": os.environ.get(
+                    "SGLANG_DSPARK_CAPTURE_CHAT_TEMPLATE_SHA256"
+                ),
                 "sglang_revision": os.environ.get("SGLANG_K3_CAPTURE_SGLANG_REVISION"),
                 "corpus_sha256": os.environ.get("SGLANG_K3_CAPTURE_CORPUS_SHA256"),
                 "sampling_seed": os.environ.get("SGLANG_K3_CAPTURE_SAMPLING_SEED"),
                 "points": sorted(self.points),
                 "layers": "all" if self.layers is None else sorted(self.layers),
+                "phases": "all" if self.phases is None else sorted(self.phases),
                 "default_max_rows": self.default_max_rows,
                 "async_capture": self.async_enabled,
                 "shard_target_bytes": self.shard_target_bytes,
@@ -383,10 +424,16 @@ class ReplayTensorCapture:
         forward_mode = getattr(forward_batch, "forward_mode", "unknown")
         mode_name = getattr(forward_mode, "name", None)
         mode = str(mode_name if mode_name is not None else forward_mode).lower()
-        is_decode = getattr(forward_mode, "is_decode", None)
+        decode_checks = (
+            getattr(forward_mode, "is_decode", None),
+            getattr(forward_mode, "is_target_verify", None),
+            getattr(forward_mode, "is_draft_extend_v2", None),
+        )
+        decode_like = any(bool(check()) for check in decode_checks if callable(check))
         phase = (
             "decode"
-            if (bool(is_decode()) if callable(is_decode) else "decode" in mode)
+            if decode_like
+            or any(tag in mode for tag in ("decode", "target_verify", "draft_extend"))
             else "prefill"
         )
         prefix_lens = getattr(forward_batch, "extend_prefix_lens_cpu", None)
@@ -395,6 +442,7 @@ class ReplayTensorCapture:
         seq_lens = [] if seq_lens is None else seq_lens
         max_prefix = max((int(x) for x in prefix_lens), default=0)
         max_seq = max((int(x) for x in seq_lens), default=0)
+        forward_iter = getattr(forward_batch, "forward_iter", -1)
         self._context = {
             "phase": phase,
             "forward_mode": mode,
@@ -409,6 +457,7 @@ class ReplayTensorCapture:
             "max_prefix_len": max_prefix,
             "max_sequence_len": max_seq,
             "batch_size": int(getattr(forward_batch, "batch_size", 0) or 0),
+            "forward_id": -1 if forward_iter is None else int(forward_iter),
             "tp_rank": self.tp_rank,
         }
 
@@ -567,11 +616,21 @@ class ReplayTensorCapture:
 
     def path_wants(self, point: str, layer_idx: int) -> bool:
         """Whether every TP rank must take the capture-compatible code path."""
+        return self.configured(point, layer_idx) and (
+            self.arm_file is None or self.arm_file.exists()
+        )
+
+    def configured(self, point: str, layer_idx: int) -> bool:
+        """Whether a point is selected, independent of the runtime arm gate.
+
+        Model construction uses this for capture paths that require persistent
+        structural configuration. Serialization must continue to use
+        :meth:`wants`/``path_wants`` so an unarmed process writes nothing.
+        """
         return (
             self.enabled
-            and (self.arm_file is None or self.arm_file.exists())
             and point in self.points
-            and (self.layers is None or layer_idx in self.layers)
+            and (layer_idx < 0 or self.layers is None or layer_idx in self.layers)
         )
 
     def wants(self, point: str, layer_idx: int) -> bool:
@@ -629,6 +688,8 @@ class ReplayTensorCapture:
         if not self.wants(point, layer_idx):
             return 0
         resolved_phase = phase or str(self._context.get("phase", "all"))
+        if self.phases is not None and resolved_phase.lower() not in self.phases:
+            return 0
         key = (point, layer_idx, resolved_phase)
         return max(
             0,
@@ -693,6 +754,7 @@ class ReplayTensorCapture:
         event: int,
         phase: str,
         indices: torch.Tensor | None = None,
+        preserve_rows: bool = False,
     ) -> Path:
         self._check_async_error()
         first = next((value for value in present.values() if value.ndim > 0), None)
@@ -713,7 +775,10 @@ class ReplayTensorCapture:
         for name, value in present.items():
             selected = (
                 value.index_select(0, indices)
-                if not once and value.ndim > 0 and value.shape[0] == row_count
+                if not once
+                and not preserve_rows
+                and value.ndim > 0
+                and value.shape[0] == row_count
                 # contiguous() may alias an already-contiguous workspace.  A
                 # real producer-stream clone is required before the model can
                 # reuse it while the copy stream is still transferring.
@@ -783,12 +848,15 @@ class ReplayTensorCapture:
         *,
         metadata: Mapping[str, Any] | None = None,
         once: bool = False,
+        preserve_rows: bool = False,
     ) -> Path | None:
         """Write one bounded tensor bundle and return its path.
 
         The first non-scalar tensor defines the row count. Tensors with the
         same leading dimension are sliced consistently; static tensors (for
-        example correction bias) are retained in full.
+        example correction bias) are retained in full. ``preserve_rows`` makes
+        the complete bundle one budgeted event, which is required for token
+        sequences whose continuity would be destroyed by row sampling.
         """
         if not self.wants(point, layer_idx):
             return None
@@ -810,7 +878,7 @@ class ReplayTensorCapture:
             }
             row_count = (
                 1
-                if once
+                if once or preserve_rows
                 else next(
                     (
                         int(value.shape[0])
@@ -821,7 +889,12 @@ class ReplayTensorCapture:
                 )
             )
             take = min(row_count, remaining)
-            if self.async_enabled and self.split_rows_across_ranks and not once:
+            if (
+                self.async_enabled
+                and self.split_rows_across_ranks
+                and not once
+                and not preserve_rows
+            ):
                 if row_count < self.tp_world_size:
                     if call_index % self.tp_world_size != self.tp_rank:
                         return None
@@ -870,6 +943,7 @@ class ReplayTensorCapture:
                     event,
                     phase,
                     indices,
+                    preserve_rows,
                 )
 
             cpu_tensors: dict[str, torch.Tensor] = {}
@@ -879,7 +953,10 @@ class ReplayTensorCapture:
                 original_stride = list(value.stride())
                 selected = (
                     value[:take]
-                    if not once and value.ndim > 0 and value.shape[0] == row_count
+                    if not once
+                    and not preserve_rows
+                    and value.ndim > 0
+                    and value.shape[0] == row_count
                     else value
                 )
                 cpu_tensors[name] = selected.detach().contiguous().to("cpu").clone()
@@ -946,6 +1023,10 @@ def k3_capture_wants(point: str, layer_idx: int) -> bool:
     return get_replay_tensor_capture().path_wants(point, layer_idx)
 
 
+def k3_capture_configured(point: str, layer_idx: int) -> bool:
+    return get_replay_tensor_capture().configured(point, layer_idx)
+
+
 def k3_capture_remaining_rows(point: str, layer_idx: int) -> int:
     return get_replay_tensor_capture().remaining_rows(point, layer_idx)
 
@@ -965,7 +1046,13 @@ def k3_capture(
     *,
     metadata: Mapping[str, Any] | None = None,
     once: bool = False,
+    preserve_rows: bool = False,
 ) -> Path | None:
     return get_replay_tensor_capture().capture(
-        point, layer_idx, tensors, metadata=metadata, once=once
+        point,
+        layer_idx,
+        tensors,
+        metadata=metadata,
+        once=once,
+        preserve_rows=preserve_rows,
     )

@@ -17,6 +17,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.observability.hotloop_profile import semantic_range
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
@@ -128,26 +129,30 @@ class DsparkDraftSampler:
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.gamma
-        base_logits, confidence_tap = self.model.compute_base_logits(hidden_states)
+        with semantic_range("speculative.draft.base_logits", batch_size=bs):
+            base_logits, confidence_tap = self.model.compute_base_logits(hidden_states)
         base_logits = base_logits.view(bs, self.gamma, -1)
         anchor = input_ids.view(bs, self.gamma)[:, 0]
 
         def _step_sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
-            del step_idx
-            noise = self.exp_noise[:bs].exponential_()
-            return SampleStepTokens.execute(
-                step_logits=step_logits,
-                temperatures=self.temperatures[:bs],
-                greedy_mask=self.greedy_mask[:bs],
-                exp_noise=noise,
-            )
+            with semantic_range(
+                "speculative.draft.sample_step", batch_size=bs, step=step_idx
+            ):
+                noise = self.exp_noise[:bs].exponential_()
+                return SampleStepTokens.execute(
+                    step_logits=step_logits,
+                    temperatures=self.temperatures[:bs],
+                    greedy_mask=self.greedy_mask[:bs],
+                    exp_noise=noise,
+                )
 
-        draft_tokens, corrected_logits = self.markov_head.sample_block(
-            base_logits,
-            first_prev_tokens=anchor,
-            hidden_states=hidden_states.view(bs, self.gamma, -1),
-            sampler=_step_sampler,
-        )
+        with semantic_range("speculative.draft.markov", batch_size=bs):
+            draft_tokens, corrected_logits = self.markov_head.sample_block(
+                base_logits,
+                first_prev_tokens=anchor,
+                hidden_states=hidden_states.view(bs, self.gamma, -1),
+                sampler=_step_sampler,
+            )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
         self.corrected_out[: bs * self.gamma].copy_(
             corrected_logits.reshape(bs * self.gamma, -1)
@@ -271,12 +276,13 @@ def sample_draft_block(
                 sampled_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
                 return torch.where(greedy_mask, argmax_tokens, sampled_tokens)
 
-    draft_tokens, corrected_logits = markov_head.sample_block(
-        base_logits,
-        first_prev_tokens=anchor_tokens,
-        hidden_states=draft_hidden,
-        sampler=sampler,
-    )
+    with semantic_range("speculative.draft.markov", batch_size=bs):
+        draft_tokens, corrected_logits = markov_head.sample_block(
+            base_logits,
+            first_prev_tokens=anchor_tokens,
+            hidden_states=draft_hidden,
+            sampler=sampler,
+        )
     return DraftBlockResult(
         draft_tokens=draft_tokens,
         corrected_logits=corrected_logits,
@@ -360,7 +366,9 @@ class DraftBlockProposer:
             if draft_sampler.confidence_out is not None:
                 folded_confidence = draft_sampler.confidence_out[:bs]
         else:
-            with self._base_logits_context():
+            with semantic_range(
+                "speculative.draft.base_logits", batch_size=bs
+            ), self._base_logits_context():
                 base_logits, confidence_tap = self.draft_model.compute_base_logits(
                     fwd.raw_hidden
                 )
@@ -467,7 +475,9 @@ class DraftBlockProposer:
             and graph_runner.can_run_graph(draft_forward_batch)
         ):
             draft_sampler.stage_sampling_params(bs=bs, sampling_info=sampling_info)
-        with torch.inference_mode():
+        with semantic_range(
+            "speculative.draft.model_forward", batch_size=bs
+        ), torch.inference_mode():
             draft_out = self.draft_model_runner.forward(draft_forward_batch)
         logits_output = draft_out.logits_output
         raw_hidden = logits_output.hidden_states

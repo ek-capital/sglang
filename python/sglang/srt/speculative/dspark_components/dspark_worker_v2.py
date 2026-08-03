@@ -537,14 +537,15 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         target_model = self.target_worker.model_runner.model
 
-        verify_window = alloc_verify_window(
-            batch=batch,
-            bs=bs,
-            device=device,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            block_pos_offsets=self._block_pos_offsets,
-            model_runner=self.model_runner,
-        )
+        with semantic_range("speculative.prepare_window", batch_size=bs):
+            verify_window = alloc_verify_window(
+                batch=batch,
+                bs=bs,
+                device=device,
+                verify_num_draft_tokens=self.verify_num_draft_tokens,
+                block_pos_offsets=self._block_pos_offsets,
+                model_runner=self.model_runner,
+            )
 
         sampling_info = batch.sampling_info
         with self._draft_context(), self._observers.segment(
@@ -562,22 +563,24 @@ class DSparkWorkerV2(BaseSpecWorker):
         draft_block_ids = proposal.draft_block_ids
         draft_block = proposal.draft_block
         draft_tokens = draft_block.draft_tokens
+        proposal_confidence_present = proposal.confidence is not None
 
-        confidence = proposal.confidence
-        if confidence is None:
-            confidence = self._verify_planner.compute_confidence_tensor(
-                draft_hidden=proposal.draft_hidden,
-                anchor_tokens=draft_block_ids[:, 0],
-                draft_tokens=draft_tokens,
-                confidence_tap=proposal.confidence_tap,
+        with semantic_range("speculative.confidence_budget", batch_size=bs):
+            confidence = proposal.confidence
+            if confidence is None:
+                confidence = self._verify_planner.compute_confidence_tensor(
+                    draft_hidden=proposal.draft_hidden,
+                    anchor_tokens=draft_block_ids[:, 0],
+                    draft_tokens=draft_tokens,
+                    confidence_tap=proposal.confidence_tap,
+                )
+
+            verify_token_budget = self._verify_planner.resolve_verify_token_budget(
+                draft_input=draft_input,
+                confidence=confidence,
+                prefix_lens=prefix_lens,
+                req_pool_indices=batch.req_pool_indices,
             )
-
-        verify_token_budget = self._verify_planner.resolve_verify_token_budget(
-            draft_input=draft_input,
-            confidence=confidence,
-            prefix_lens=prefix_lens,
-            req_pool_indices=batch.req_pool_indices,
-        )
 
         global_num_reqs = (
             max(batch.global_num_tokens)
@@ -586,15 +589,16 @@ class DSparkWorkerV2(BaseSpecWorker):
             and batch.global_num_tokens is not None
             else None
         )
-        layout = self._verify_planner.schedule_layout(
-            req_pool_indices=batch.req_pool_indices,
-            prefix_lens=prefix_lens,
-            device=device,
-            confidence=confidence,
-            budget=verify_token_budget,
-            global_num_reqs=global_num_reqs,
-            dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
-        )
+        with semantic_range("speculative.schedule_layout", batch_size=bs):
+            layout = self._verify_planner.schedule_layout(
+                req_pool_indices=batch.req_pool_indices,
+                prefix_lens=prefix_lens,
+                device=device,
+                confidence=confidence,
+                budget=verify_token_budget,
+                global_num_reqs=global_num_reqs,
+                dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
+            )
         run_compact = self._verify_planner.should_run_compact(layout=layout)
 
         verify_ids_2d = torch.cat(
@@ -661,43 +665,48 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         epilogue = self._verify_executor.verify_epilogue
         folded_accept = fold_eligible and run_compact and can_run_cuda_graph
-        accept = self._verify_executor.accept_and_finalize(
-            folded_accept=folded_accept,
-            bs=bs,
-            verify_ids_2d=verify_ids_2d,
-            target_logits=logits_output.next_token_logits,
-            draft_block=draft_block,
-            sampling_info=sampling_info,
-            draft_input=draft_input,
-            layout=layout,
-            prefix_lens=prefix_lens,
-            draft_tokens=draft_tokens,
-        )
+        with semantic_range(
+            "speculative.accept_finalize", batch_size=bs, folded=folded_accept
+        ):
+            accept = self._verify_executor.accept_and_finalize(
+                folded_accept=folded_accept,
+                bs=bs,
+                verify_ids_2d=verify_ids_2d,
+                target_logits=logits_output.next_token_logits,
+                draft_block=draft_block,
+                sampling_info=sampling_info,
+                draft_input=draft_input,
+                layout=layout,
+                prefix_lens=prefix_lens,
+                draft_tokens=draft_tokens,
+            )
         if on_publish is not None:
             if confidence is not None:
                 on_publish(accept.new_seq_lens, confidence=confidence)
             else:
                 on_publish(accept.new_seq_lens)
 
-        self._commit_target_mamba_states_after_verify(
-            batch=batch,
-            seq_lens_pre_verify=prefix_lens,
-            seq_lens_post_verify=accept.new_seq_lens,
-            commit_lens=accept.commit_lens,
-        )
+        with semantic_range("speculative.kda_commit", batch_size=bs):
+            self._commit_target_mamba_states_after_verify(
+                batch=batch,
+                seq_lens_pre_verify=prefix_lens,
+                seq_lens_post_verify=accept.new_seq_lens,
+                commit_lens=accept.commit_lens,
+            )
 
         folded_commit = folded_accept and epilogue.folds_commit
         if not folded_commit:
-            self._verify_executor.commit_hidden(
-                batch=batch,
-                layout=layout,
-                hidden_strided=hidden_strided,
-                verify_window=verify_window,
-                logits_output=logits_output,
-                commit_lens=accept.commit_lens,
-                bs=bs,
-                run_compact=run_compact,
-            )
+            with semantic_range("speculative.hidden_commit", batch_size=bs):
+                self._verify_executor.commit_hidden(
+                    batch=batch,
+                    layout=layout,
+                    hidden_strided=hidden_strided,
+                    verify_window=verify_window,
+                    logits_output=logits_output,
+                    commit_lens=accept.commit_lens,
+                    bs=bs,
+                    run_compact=run_compact,
+                )
         logits_output.hidden_states = None
 
         self._observers.observe_verify_step(
@@ -723,10 +732,109 @@ class DSparkWorkerV2(BaseSpecWorker):
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
         )
 
-        if (
-            confidence is not None
-            and replay_capture_wants("speculative.draft_round", -1)
-        ):
+        spec_capture_operations = (
+            "speculative.draft_generation",
+            "speculative.verify_plan",
+            "speculative.acceptance",
+            "speculative.draft_round",
+        )
+        wanted_spec_captures = {
+            operation: replay_capture_wants(operation, -1)
+            for operation in spec_capture_operations
+        }
+        if any(wanted_spec_captures.values()):
+            from sglang.kernels.ops.speculative.dspark.dspark_accept import (
+                last_accept_random_samples,
+            )
+
+            accept_random = (
+                None
+                if sampling_info is None or sampling_info.is_all_greedy
+                else last_accept_random_samples()
+            )
+            verify_width = (
+                torch.full(
+                    (bs,),
+                    self.verify_num_draft_tokens,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                if layout is None
+                else layout.verify_lens
+            )
+            target_logits = logits_output.next_token_logits
+            if target_logits.shape[0] % bs == 0:
+                target_logits = target_logits.reshape(bs, -1, target_logits.shape[-1])
+
+        common_metadata = {
+            "forward_id": int(batch.forward_iter),
+            "batch_size": bs,
+            "proposal_folded": proposal.folded,
+            "run_compact": run_compact,
+            "proposal_confidence_present": proposal_confidence_present,
+            "sampling_mode": (
+                "greedy"
+                if sampling_info is None or sampling_info.is_all_greedy
+                else "sampling"
+            ),
+        }
+        if wanted_spec_captures["speculative.draft_generation"]:
+            replay_capture_bundle(
+                "speculative.draft_generation",
+                -1,
+                {
+                    "anchor_token_ids": draft_block_ids[:, 0],
+                    "positions": prefix_lens,
+                    "verify_token_ids": verify_ids_2d,
+                    "proposed_token_ids": draft_tokens,
+                    "draft_hidden_before": getattr(draft_input, "hidden_states", None),
+                    "draft_hidden_after": proposal.draft_hidden,
+                    "proposal_scores": draft_block.corrected_logits,
+                    "confidence": confidence,
+                    "greedy_mask": draft_block.greedy_mask,
+                    "temperatures": draft_block.temperatures,
+                },
+                metadata=common_metadata,
+            )
+        if wanted_spec_captures["speculative.verify_plan"]:
+            replay_capture_bundle(
+                "speculative.verify_plan",
+                -1,
+                {
+                    "confidence": confidence,
+                    "prefix_lengths": prefix_lens,
+                    "request_pool_indices": batch.req_pool_indices,
+                    "verify_width": verify_width,
+                    "cap_trim_lengths": accept.cap_trim_lens,
+                },
+                metadata=common_metadata,
+            )
+        if wanted_spec_captures["speculative.acceptance"]:
+            replay_capture_bundle(
+                "speculative.acceptance",
+                -1,
+                {
+                    "proposed_token_ids": draft_tokens,
+                    "verify_token_ids": verify_ids_2d,
+                    "proposal_scores": draft_block.corrected_logits,
+                    "target_logits": target_logits,
+                    "correct_length": accept.correct_len,
+                    "accepted_length": accept.commit_lens,
+                    "bonus_token_ids": accept.bonus,
+                    "committed_token_ids": accept.out_tokens,
+                    "greedy_mask": draft_block.greedy_mask,
+                    "temperatures": draft_block.temperatures,
+                    "accept_uniform_samples": (
+                        None if accept_random is None else accept_random[0][:bs]
+                    ),
+                    "accept_uniform_samples_final": (
+                        None if accept_random is None else accept_random[1][:bs]
+                    ),
+                    "cap_trim_lengths": accept.cap_trim_lens,
+                },
+                metadata=common_metadata,
+            )
+        if wanted_spec_captures["speculative.draft_round"]:
             replay_capture_bundle(
                 "speculative.draft_round",
                 -1,
@@ -736,20 +844,32 @@ class DSparkWorkerV2(BaseSpecWorker):
                     # is sufficient to reconstruct the per-request positions.
                     "positions": prefix_lens,
                     "proposed_token_ids": draft_tokens,
+                    "verify_token_ids": verify_ids_2d,
                     "proposal_scores": draft_block.corrected_logits,
                     "confidence": confidence,
-                    "verify_width": layout.verify_lens,
+                    "verify_width": verify_width,
+                    "correct_length": accept.correct_len,
                     "accepted_length": accept.commit_lens,
-                    "draft_state_before": getattr(
-                        draft_input, "hidden_states", None
+                    "bonus_token_ids": accept.bonus,
+                    "committed_token_ids": accept.out_tokens,
+                    "new_sequence_lengths": accept.new_seq_lens,
+                    "request_pool_indices": batch.req_pool_indices,
+                    "draft_hidden_before": getattr(draft_input, "hidden_states", None),
+                    "draft_hidden_after": proposal.draft_hidden,
+                    "greedy_mask": draft_block.greedy_mask,
+                    "temperatures": draft_block.temperatures,
+                    "cap_trim_lengths": accept.cap_trim_lens,
+                    "target_logits": target_logits,
+                    "accept_uniform_samples": (
+                        None if accept_random is None else accept_random[0][:bs]
                     ),
-                    "draft_state_after": proposal.draft_hidden,
+                    "accept_uniform_samples_final": (
+                        None if accept_random is None else accept_random[1][:bs]
+                    ),
                 },
                 metadata={
-                    "forward_id": int(batch.forward_iter),
-                    "batch_size": bs,
-                    "proposal_folded": proposal.folded,
-                    "run_compact": run_compact,
+                    **common_metadata,
+                    "derived_confidence_captured": confidence is not None,
                 },
             )
 

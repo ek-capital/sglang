@@ -32,8 +32,12 @@ def semantic_range(name: str, **dimensions: object) -> Iterator[None]:
         return
     suffix = ",".join(f"{key}={dimensions[key]}" for key in sorted(dimensions))
     label = f"sglang.hotloop/{name}" + (f"/{suffix}" if suffix else "")
-    torch.cuda.nvtx.range_push(label)
-    try:
-        yield
-    finally:
-        torch.cuda.nvtx.range_pop()
+    # NVTX is consumed by Nsight Systems. record_function emits the same
+    # semantic boundary into Torch Chrome traces, which otherwise contain only
+    # opaque kernel names when GPU-only activities are requested.
+    with torch.profiler.record_function(label):
+        torch.cuda.nvtx.range_push(label)
+        try:
+            yield
+        finally:
+            torch.cuda.nvtx.range_pop()

@@ -117,6 +117,32 @@ def test_collective_plan_requires_all_ranks(tmp_path, monkeypatch):
         K3TensorCapture()
 
 
+def test_plan_applies_phase_and_rank_defaults(tmp_path, monkeypatch):
+    plan = tmp_path / "plan.json"
+    plan.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "operations": ["attention.kda_target_verify"],
+                "phases": ["decode"],
+                "ranks": "all",
+                "require_all_ranks": True,
+            }
+        )
+    )
+    monkeypatch.setenv("SGLANG_REPLAY_CAPTURE_DIR", str(tmp_path / "capture"))
+    monkeypatch.setenv("SGLANG_REPLAY_CAPTURE_PLAN", str(plan))
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_ARM_FILE", str(tmp_path / "ARMED"))
+    monkeypatch.delenv("SGLANG_K3_CAPTURE_PHASES", raising=False)
+    monkeypatch.delenv("SGLANG_K3_CAPTURE_RANKS", raising=False)
+
+    capture = K3TensorCapture()
+
+    assert capture.phases == {"decode"}
+    assert capture.rank_allowed
+    assert capture.points == {"bundle.attention.kda_target_verify"}
+
+
 def test_k3_tensor_capture_waits_for_arm_file(tmp_path, monkeypatch):
     arm_file = tmp_path / "ARMED"
     monkeypatch.setenv("SGLANG_K3_CAPTURE_DIR", str(tmp_path / "capture"))
@@ -225,6 +251,22 @@ def test_numeric_forward_mode_uses_decode_predicate(tmp_path, monkeypatch):
     assert capture._context["forward_mode"] == "decode"
 
 
+def test_forward_context_preserves_zero_forward_id(tmp_path, monkeypatch):
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_DIR", str(tmp_path))
+    capture = K3TensorCapture()
+    capture.set_forward_context(
+        SimpleNamespace(
+            forward_mode="DECODE",
+            forward_iter=0,
+            extend_prefix_lens_cpu=None,
+            extend_seq_lens_cpu=None,
+            batch_size=1,
+        )
+    )
+
+    assert capture._context["forward_id"] == 0
+
+
 def test_async_capture_packs_and_uploads_composite_shard(tmp_path, monkeypatch):
     persistent = tmp_path / "persistent"
     local = tmp_path / "local"
@@ -272,9 +314,9 @@ def test_expert_quota_sampling_records_assignment_coverage(tmp_path, monkeypatch
     )
     capture.close()
 
-    quota = json.loads(
-        (tmp_path / "rank-00000" / "capture-close.json").read_text()
-    )["expert_quotas"][0]
+    quota = json.loads((tmp_path / "rank-00000" / "capture-close.json").read_text())[
+        "expert_quotas"
+    ][0]
     assert quota["experts_at_quota"] == 4
     assert quota["min_assignments"] == 2
 
@@ -326,9 +368,7 @@ def test_tp_split_row_limit_is_global_not_per_rank(tmp_path, monkeypatch):
     assert capture._row_limit("layer_input") == 1
 
 
-def test_context_keeps_corpus_and_runtime_cache_strata_separate(
-    tmp_path, monkeypatch
-):
+def test_context_keeps_corpus_and_runtime_cache_strata_separate(tmp_path, monkeypatch):
     monkeypatch.setenv("SGLANG_K3_CAPTURE_DIR", str(tmp_path))
     capture = K3TensorCapture()
     capture.set_forward_context(
@@ -342,9 +382,7 @@ def test_context_keeps_corpus_and_runtime_cache_strata_separate(
     )
 
     assert capture._context["runtime_prefix_cache"] == "miss"
-    assert capture._context["corpus_metadata"] == {
-        "prefix_reuse_group": "group-a"
-    }
+    assert capture._context["corpus_metadata"] == {"prefix_reuse_group": "group-a"}
 
 
 def test_single_row_decode_calls_are_round_robined_across_ranks(tmp_path, monkeypatch):

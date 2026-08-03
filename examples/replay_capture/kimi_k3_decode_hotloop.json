@@ -1,0 +1,62 @@
+{
+  "format_version": 1,
+  "model_family": "kimi_k3",
+  "purpose": "Decode-hotloop replay corpus for TP8 Kimi-K3 plus DSpark",
+  "max_gib_per_rank": 550,
+  "operations": [
+    "speculative.draft_round",
+    "moe.shared_mlp",
+    "moe.tail",
+    "residual.attnres",
+    "collective.tp_residual"
+  ],
+  "points": [
+    "layer_input",
+    "layer_output",
+    "attention_input",
+    "attention_output",
+    "kda",
+    "kda_state_decode",
+    "mla_latent",
+    "mla_gate",
+    "moe_input",
+    "moe_w13_input",
+    "moe_w2_input",
+    "moe_output",
+    "routing",
+    "routing_static",
+    "expert_output",
+    "attn_res",
+    "attn_res_state",
+    "attn_res_static",
+    "lm_head"
+  ],
+  "max_rows_per_operation": {
+    "speculative.draft_round": 8192,
+    "moe.shared_mlp": 8192,
+    "moe.tail": 8192,
+    "residual.attnres": 4096,
+    "collective.tp_residual": 4096
+  },
+  "max_rows_per_point": {
+    "layer_input": 2048,
+    "layer_output": 2048,
+    "attention_input": 4096,
+    "attention_output": 4096,
+    "kda": 8192,
+    "kda_state_decode": 512,
+    "mla_latent": 8192,
+    "mla_gate": 8192,
+    "moe_input": 8192,
+    "moe_w13_input": 8192,
+    "moe_w2_input": 8192,
+    "moe_output": 8192,
+    "routing": 32768,
+    "routing_static": 1,
+    "expert_output": 65536,
+    "attn_res": 4096,
+    "attn_res_state": 1024,
+    "attn_res_static": 1,
+    "lm_head": 8192
+  }
+}

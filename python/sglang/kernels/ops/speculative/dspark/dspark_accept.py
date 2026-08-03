@@ -12,11 +12,24 @@ from sglang.kernels.ops.speculative.reject_sampling import (
     chain_speculative_sampling_triton,
 )
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.observability.hotloop_profile import semantic_range
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
     build_dflash_verify_target_probs,
     compute_dflash_correct_drafts_and_bonus,
 )
+
+_LAST_ACCEPT_RANDOM_SAMPLES: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+
+
+def last_accept_random_samples() -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    """Return the live buffers consumed by the most recent sampling accept.
+
+    CUDA-graph capture retains these tensor objects and updates their contents
+    on replay, so the outer DSpark replay bundle can snapshot the exact random
+    variates without changing the acceptance-kernel interface.
+    """
+    return _LAST_ACCEPT_RANDOM_SAMPLES
 
 
 class AcceptSampling:
@@ -90,21 +103,25 @@ def _accept_sampling_core(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
     device = candidates.device
-    if not sampling_info.need_top_k_sampling and not sampling_info.need_top_p_sampling:
-        target_probs = SoftmaxTemp.execute(
-            logits=target_logits,
-            temperatures=sampling_info.temperatures,
-            rows_per_request=verify_num_draft_tokens,
-        ).view(bs, verify_num_draft_tokens, -1)
-    else:
-        target_probs = build_dflash_verify_target_probs(
-            next_token_logits=target_logits,
-            sampling_info=sampling_info,
-            draft_token_num=verify_num_draft_tokens,
-            bs=bs,
-            max_top_k=draft_input.max_top_k,
-            uniform_top_k_value=draft_input.uniform_top_k_value,
-        )
+    with semantic_range("speculative.accept.probabilities", batch_size=bs):
+        if (
+            not sampling_info.need_top_k_sampling
+            and not sampling_info.need_top_p_sampling
+        ):
+            target_probs = SoftmaxTemp.execute(
+                logits=target_logits,
+                temperatures=sampling_info.temperatures,
+                rows_per_request=verify_num_draft_tokens,
+            ).view(bs, verify_num_draft_tokens, -1)
+        else:
+            target_probs = build_dflash_verify_target_probs(
+                next_token_logits=target_logits,
+                sampling_info=sampling_info,
+                draft_token_num=verify_num_draft_tokens,
+                bs=bs,
+                max_top_k=draft_input.max_top_k,
+                uniform_top_k_value=draft_input.uniform_top_k_value,
+            )
     (
         retrieve_index,
         retrieve_next_token,
@@ -119,22 +136,25 @@ def _accept_sampling_core(
     )
     uniform_samples = torch.rand((bs, gamma), dtype=torch.float32, device=device)
     uniform_samples_final = torch.rand((bs,), dtype=torch.float32, device=device)
-    chain_speculative_sampling_triton(
-        predicts=predicts,
-        accept_index=accept_index,
-        accept_token_num=accept_token_num,
-        candidates=candidates,
-        retrive_index=retrieve_index,
-        retrive_next_token=retrieve_next_token,
-        retrive_next_sibling=retrieve_next_sibling,
-        uniform_samples=uniform_samples,
-        uniform_samples_for_final_sampling=uniform_samples_final,
-        target_probs=target_probs,
-        draft_probs=draft_probs,
-        threshold_single=1.0,
-        threshold_acc=1.0,
-        deterministic=True,
-    )
+    global _LAST_ACCEPT_RANDOM_SAMPLES
+    _LAST_ACCEPT_RANDOM_SAMPLES = (uniform_samples, uniform_samples_final)
+    with semantic_range("speculative.accept.rejection", batch_size=bs):
+        chain_speculative_sampling_triton(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates,
+            retrive_index=retrieve_index,
+            retrive_next_token=retrieve_next_token,
+            retrive_next_sibling=retrieve_next_sibling,
+            uniform_samples=uniform_samples,
+            uniform_samples_for_final_sampling=uniform_samples_final,
+            target_probs=target_probs,
+            draft_probs=draft_probs,
+            threshold_single=1.0,
+            threshold_acc=1.0,
+            deterministic=True,
+        )
     correct_len = accept_token_num
     if cutoff_verify_lens is not None:
         correct_len, cap_trim_lens = CapCorrectLen.execute(

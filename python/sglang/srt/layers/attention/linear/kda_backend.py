@@ -13,6 +13,10 @@ from sglang.srt.debug_utils.k3_tensor_capture import (
     k3_capture_remaining_rows,
     k3_capture_wants,
 )
+from sglang.srt.debug_utils.replay_capture import (
+    replay_capture_bundle,
+    replay_capture_wants,
+)
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 from sglang.srt.layers.attention.linear.utils import (
@@ -680,9 +684,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         ssm_states = mamba_cache_params.temporal
 
-        capture_chunk_states = k3_capture_wants(
-            "kda_state_extend", layer.layer_id
-        )
+        capture_chunk_states = k3_capture_wants("kda_state_extend", layer.layer_id)
         serialize_chunk_states = (
             k3_capture_remaining_rows("kda_state_extend", layer.layer_id) > 0
         )
@@ -851,6 +853,167 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         draft_token_num = forward_batch.spec_info.draft_token_num
         ragged_layout = forward_batch.spec_info.ragged_verify_layout
+        capture_verify = replay_capture_wants(
+            "attention.kda_target_verify", layer.layer_id
+        )
+        capture_rows = min(
+            int(cache_indices.numel()),
+            k3_capture_remaining_rows(
+                "bundle.attention.kda_target_verify", layer.layer_id
+            ),
+        )
+        capture_state_indices = None
+        capture_intermediate_indices = None
+        conv_states_before = None
+        ssm_states_before = None
+        replayssm_before = None
+        if capture_verify and capture_rows > 0:
+            if ragged_layout is not None:
+                raise RuntimeError(
+                    "KDA TARGET_VERIFY replay capture currently requires the "
+                    "deployed static linear verify layout; use a separate capture "
+                    "plan before enabling ragged verification"
+                )
+            capture_state_indices = cache_indices[:capture_rows].to(torch.long)
+            capture_intermediate_indices = intermediate_state_indices[:capture_rows].to(
+                torch.long
+            )
+            # These persistent checkpoints are mutated by the later accept/commit
+            # phase, so snapshot them before launching the verify kernel.
+            conv_states_before = conv_states.index_select(
+                0, capture_state_indices
+            ).clone()
+            ssm_states_before = ssm_states.index_select(
+                0, capture_state_indices
+            ).clone()
+            if replayssm_on:
+                replayssm_before = {
+                    "replayssm_rawv_before": replayssm_rawv.index_select(
+                        0, capture_state_indices
+                    ).clone(),
+                    "replayssm_rawk_before": mamba_cache_params.replayssm_rawk.index_select(
+                        0, capture_state_indices
+                    ).clone(),
+                    "replayssm_g_before": mamba_cache_params.replayssm_g.index_select(
+                        0, capture_state_indices
+                    ).clone(),
+                    "replayssm_beta_before": mamba_cache_params.replayssm_beta.index_select(
+                        0, capture_state_indices
+                    ).clone(),
+                }
+
+        def capture_target_verify_result(
+            core_attn_out: torch.Tensor, *, kernel: str
+        ) -> torch.Tensor:
+            if capture_state_indices is None:
+                return core_attn_out
+            assert capture_intermediate_indices is not None
+            assert conv_states_before is not None and ssm_states_before is not None
+            batch_size = int(cache_indices.numel())
+            dense_shape = (batch_size, draft_token_num)
+
+            def dense_rows(value: torch.Tensor) -> torch.Tensor:
+                value = _capture_row_major(value)
+                return value.reshape(*dense_shape, *value.shape[1:])[:capture_rows]
+
+            optional = {
+                **(replayssm_before or {}),
+                "intermediate_ssm_after": (
+                    None
+                    if intermediate_state_cache is None
+                    else intermediate_state_cache.index_select(
+                        0, capture_intermediate_indices
+                    )
+                ),
+                "replayssm_rawv_after": (
+                    None
+                    if replayssm_rawv is None
+                    else replayssm_rawv.index_select(0, capture_state_indices)
+                ),
+                "replayssm_rawk_after": (
+                    None
+                    if mamba_cache_params.replayssm_rawk is None
+                    else mamba_cache_params.replayssm_rawk.index_select(
+                        0, capture_state_indices
+                    )
+                ),
+                "replayssm_g_after": (
+                    None
+                    if mamba_cache_params.replayssm_g is None
+                    else mamba_cache_params.replayssm_g.index_select(
+                        0, capture_state_indices
+                    )
+                ),
+                "replayssm_beta_after": (
+                    None
+                    if mamba_cache_params.replayssm_beta is None
+                    else mamba_cache_params.replayssm_beta.index_select(
+                        0, capture_state_indices
+                    )
+                ),
+                "retrieve_next_token": retrieve_next_token,
+                "retrieve_next_sibling": retrieve_next_sibling,
+                "retrieve_parent_token": retrieve_parent_token,
+                "output_norm_gate": (
+                    None
+                    if getattr(layer, "_k3_onorm_gate", None) is None
+                    else dense_rows(layer._k3_onorm_gate)
+                ),
+                "output_norm_weight": (
+                    None
+                    if getattr(layer, "_k3_fused_decode_args", None) is None
+                    else layer._k3_fused_decode_args[5]
+                ),
+                "output_norm_eps": (
+                    None
+                    if getattr(layer, "_k3_fused_decode_args", None) is None
+                    else torch.tensor(
+                        float(layer._k3_fused_decode_args[6]),
+                        dtype=torch.float32,
+                        device=mixed_qkv.device,
+                    )
+                ),
+            }
+            tensors = {
+                "mixed_qkv": dense_rows(mixed_qkv),
+                "forget_gate": dense_rows(a),
+                "beta": dense_rows(b),
+                "cache_indices": capture_state_indices,
+                "query_lengths": torch.diff(query_start_loc)[:capture_rows],
+                "conv_states_before": conv_states_before,
+                "ssm_states_before": ssm_states_before,
+                "conv_weights": layer.conv_weights,
+                "conv_bias": layer.bias,
+                "a_log": layer.A_log,
+                "dt_bias": layer.dt_bias,
+                "lower_bound": torch.tensor(
+                    float(layer.lower_bound),
+                    dtype=torch.float32,
+                    device=mixed_qkv.device,
+                ),
+                "intermediate_conv_windows_after": (
+                    intermediate_conv_window_cache.index_select(
+                        0, capture_intermediate_indices
+                    )
+                ),
+                "core_attn_out": dense_rows(core_attn_out),
+                **optional,
+            }
+            replay_capture_bundle(
+                "attention.kda_target_verify",
+                layer.layer_id,
+                tensors,
+                metadata={
+                    "kernel": kernel,
+                    "forward_mode": "target_verify",
+                    "draft_token_count": draft_token_num,
+                    "batch_size": batch_size,
+                    "replayssm": replayssm_on,
+                    "dense_linear_layout": True,
+                },
+            )
+            return core_attn_out
+
         if self._can_run_dspark_cutedsl_mtp(
             layer=layer,
             mixed_qkv=mixed_qkv,
@@ -865,7 +1028,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             retrieve_parent_token=retrieve_parent_token,
             replayssm_rawv=replayssm_rawv,
         ):
-            return self._run_dspark_cutedsl_mtp(
+            result = self._run_dspark_cutedsl_mtp(
                 layer=layer,
                 mixed_qkv=mixed_qkv,
                 a=a,
@@ -882,6 +1045,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 replayssm_g=mamba_cache_params.replayssm_g,
                 replayssm_beta=mamba_cache_params.replayssm_beta,
             )
+            return capture_target_verify_result(result, kernel="nv_cutedsl_mtp")
         if ragged_layout is None:
             batch_size = seq_len // draft_token_num
             dense_token_indices = None
@@ -981,7 +1145,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # stay finite. Uncovered == clamped-to-ghost.
             covered = dense_token_indices < (batch_size * draft_token_num)
             core_attn_out = torch.where(covered.view(1, -1, 1, 1), core_attn_out, 0.0)
-        return core_attn_out
+        return capture_target_verify_result(core_attn_out, kernel="target_verify")
 
     def _can_run_dspark_cutedsl_mtp(
         self,

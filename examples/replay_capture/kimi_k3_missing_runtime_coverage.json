@@ -1,0 +1,18 @@
+{
+  "attention.kda_target_verify": {
+    "minimum_bundles": 24,
+    "minimum_bundles_per_rank": 3,
+    "minimum_layers": 3,
+    "minimum_forward_ids": 2,
+    "maximum_observed_batch_size": 8,
+    "required_ranks": "all",
+    "forward_modes": ["target_verify"]
+  },
+  "speculative.draft_round": {
+    "minimum_bundles": 8,
+    "minimum_forward_ids": 8,
+    "minimum_observed_batch_size": 1,
+    "maximum_observed_batch_size": 8,
+    "required_ranks": [0]
+  }
+}

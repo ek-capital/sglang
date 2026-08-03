@@ -1,0 +1,17 @@
+{
+  "format_version": 1,
+  "model_family": "kimi_k3",
+  "purpose": "Narrow supplement: complete DSpark rounds and KDA TARGET_VERIFY only",
+  "max_gib_per_rank": 32,
+  "ranks": "all",
+  "require_all_ranks": true,
+  "phases": ["decode"],
+  "operations": [
+    "speculative.draft_round",
+    "attention.kda_target_verify"
+  ],
+  "max_rows_per_operation": {
+    "speculative.draft_round": 16,
+    "attention.kda_target_verify": 8
+  }
+}

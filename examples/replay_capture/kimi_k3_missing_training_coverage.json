@@ -1,0 +1,8 @@
+{
+  "speculative.dspark_training_window": {
+    "minimum_bundles": 16,
+    "minimum_forward_ids": 16,
+    "minimum_tokens": 8192,
+    "required_ranks": [0]
+  }
+}
