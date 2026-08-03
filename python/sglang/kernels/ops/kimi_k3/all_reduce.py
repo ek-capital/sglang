@@ -34,6 +34,7 @@ C++-side).
 
 from __future__ import annotations
 
+import itertools
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
@@ -44,6 +45,11 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.debug_utils.replay_capture import (
+    replay_capture_bundle,
+    replay_capture_wants,
+)
+from sglang.srt.observability.hotloop_profile import semantic_range
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -82,6 +88,37 @@ class _CommEntry(NamedTuple):
 
 
 _COMM_MAP: dict[int, _CommEntry] = {}
+_CAPTURE_SEQUENCE = itertools.count()
+
+
+def _capture_residual_collective(
+    *,
+    algorithm: str,
+    world_size: int,
+    rank_partial: torch.Tensor | None,
+    residual: torch.Tensor | None,
+    output: torch.Tensor,
+    sequence: int,
+) -> None:
+    if rank_partial is None:
+        return
+    replay_capture_bundle(
+        "collective.tp_residual",
+        -1,
+        {
+            "rank_partial": rank_partial,
+            "pending_residual": (
+                residual if residual is not None else torch.zeros_like(output)
+            ),
+            "collective_output": output,
+        },
+        metadata={
+            "algorithm": algorithm,
+            "world_size": world_size,
+            "collective_sequence": sequence,
+            "pending_residual_present": residual is not None,
+        },
+    )
 
 
 def register_comm(comm: Communicator, *, pull_sem_mc_ptr: int = 0) -> None:
@@ -269,8 +306,21 @@ def all_reduce_push_res(
     registered push workspace. ``ws_mc_base`` is the multicast VA of the v2
     workspace slab base. Call :func:`register_comm` once beforehand.
     """
+    capture = replay_capture_wants("collective.tp_residual", -1)
+    rank_partial = x.clone() if capture else None
     residual_ = residual.view(-1) if residual is not None else None
-    _push_res_op(world_size, x, residual_, ws_mc_base)
+    sequence = next(_CAPTURE_SEQUENCE)
+    with semantic_range("collective.tp_residual", algorithm="push"):
+        _push_res_op(world_size, x, residual_, ws_mc_base)
+    if capture:
+        _capture_residual_collective(
+            algorithm="push",
+            world_size=world_size,
+            rank_partial=rank_partial,
+            residual=residual,
+            output=x,
+            sequence=sequence,
+        )
     return x
 
 
@@ -341,10 +391,23 @@ def all_reduce_pull_res(
         num_blocks=num_blocks,
         unroll=unroll,
     )
+    capture = replay_capture_wants("collective.tp_residual", -1)
+    rank_partial = x.clone() if capture else None
     residual_ = residual.view(-1) if residual is not None else None
-    _pull_res_op(
-        world_size, x, residual_, input_mc_ptr, tuning.num_blocks, tuning.unroll
-    )
+    sequence = next(_CAPTURE_SEQUENCE)
+    with semantic_range("collective.tp_residual", algorithm="pull"):
+        _pull_res_op(
+            world_size, x, residual_, input_mc_ptr, tuning.num_blocks, tuning.unroll
+        )
+    if capture:
+        _capture_residual_collective(
+            algorithm="pull",
+            world_size=world_size,
+            rank_partial=rank_partial,
+            residual=residual,
+            output=x,
+            sequence=sequence,
+        )
     return x
 
 

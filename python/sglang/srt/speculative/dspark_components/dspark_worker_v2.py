@@ -4,8 +4,11 @@ from dataclasses import replace
 from typing import Optional
 
 import torch
-
 from sglang.srt.configs.hybrid_arch import mambaish_config
+from sglang.srt.debug_utils.replay_capture import (
+    replay_capture_bundle,
+    replay_capture_wants,
+)
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -15,6 +18,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     compute_position,
 )
+from sglang.srt.observability.hotloop_profile import semantic_range
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -543,7 +547,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
         sampling_info = batch.sampling_info
-        with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
+        with self._draft_context(), self._observers.segment(
+            InfoSegment.DRAFT
+        ), semantic_range("speculative.draft"):
             proposal = self._proposer.propose(
                 batch=batch,
                 draft_input=draft_input,
@@ -614,7 +620,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             and not batch.has_grammar
         )
         prepare_mamba_track_for_verify(batch)
-        with self._observers.segment(InfoSegment.TARGET_VERIFY):
+        with self._observers.segment(InfoSegment.TARGET_VERIFY), semantic_range(
+            "speculative.target_verify"
+        ):
             if run_compact:
                 target_verify, hidden_strided = self._verify_executor.run_compact(
                     batch=batch,
@@ -714,6 +722,36 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_tier_num_tokens=int(batch.spec_verify_tier_num_tokens),
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
         )
+
+        if (
+            confidence is not None
+            and replay_capture_wants("speculative.draft_round", -1)
+        ):
+            replay_capture_bundle(
+                "speculative.draft_round",
+                -1,
+                {
+                    "anchor_token_ids": draft_block_ids[:, 0],
+                    # For decode, the prefix length is the anchor position and
+                    # is sufficient to reconstruct the per-request positions.
+                    "positions": prefix_lens,
+                    "proposed_token_ids": draft_tokens,
+                    "proposal_scores": draft_block.corrected_logits,
+                    "confidence": confidence,
+                    "verify_width": layout.verify_lens,
+                    "accepted_length": accept.commit_lens,
+                    "draft_state_before": getattr(
+                        draft_input, "hidden_states", None
+                    ),
+                    "draft_state_after": proposal.draft_hidden,
+                },
+                metadata={
+                    "forward_id": int(batch.forward_iter),
+                    "batch_size": bs,
+                    "proposal_folded": proposal.folded,
+                    "run_compact": run_compact,
+                },
+            )
 
         next_draft_input = make_next_draft_input(
             bonus_tokens=accept.bonus,

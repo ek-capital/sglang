@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Bounded, opt-in tensor capture for Kimi-K3 replay datasets.
+"""Bounded tensor transport for replay datasets.
 
 The scalable path samples token rows on GPU, stages them into pinned host
 memory on a dedicated CUDA stream, packs many capture entries into large local
@@ -148,31 +148,75 @@ def _parallel_identity() -> tuple[int, int, int, int]:
     return rank, local_rank, tp_rank, world_size
 
 
-class K3TensorCapture:
+class ReplayTensorCapture:
     def __init__(self) -> None:
-        capture_dir = os.environ.get("SGLANG_K3_CAPTURE_DIR", "").strip()
+        plan_path = os.environ.get("SGLANG_REPLAY_CAPTURE_PLAN", "").strip()
+        plan: dict[str, Any] = {}
+        if plan_path:
+            with Path(plan_path).open(encoding="utf-8") as handle:
+                plan = json.load(handle)
+            if int(plan.get("format_version", 0)) != 1:
+                raise ValueError("unsupported replay capture plan format_version")
+        capture_dir = (
+            os.environ.get("SGLANG_REPLAY_CAPTURE_DIR")
+            or os.environ.get("SGLANG_K3_CAPTURE_DIR", "")
+        ).strip()
         self.enabled = bool(capture_dir)
+        if self.enabled and os.environ.get("SGLANG_HOTLOOP_PROFILE", "0").lower() in {
+            "1",
+            "true",
+            "yes",
+        }:
+            raise ValueError(
+                "replay capture and production hotloop profiling are mutually exclusive"
+            )
         self.root = Path(capture_dir) if capture_dir else None
         arm_file = os.environ.get("SGLANG_K3_CAPTURE_ARM_FILE", "").strip()
         self.arm_file = Path(arm_file) if arm_file else None
-        self.rank, self.local_rank, self.tp_rank, self.world_size = (
-            _parallel_identity()
-        )
+        self.rank, self.local_rank, self.tp_rank, self.world_size = _parallel_identity()
         self.default_max_rows = max(
             1, int(os.environ.get("SGLANG_K3_CAPTURE_MAX_ROWS", "512"))
         )
+        # Per-rank hard ceiling.  Eight GiB keeps a TP8 supplement below 64 GiB
+        # before compression; operators can lower it for narrow puzzle plans.
+        max_gib = float(
+            os.environ.get(
+                "SGLANG_REPLAY_CAPTURE_MAX_GIB",
+                str(plan.get("max_gib_per_rank", 8)),
+            )
+        )
+        self.max_bytes = max(1, int(max_gib * 2**30))
+        self._bytes_reserved = 0
         self.layers = _parse_layers(os.environ.get("SGLANG_K3_CAPTURE_LAYERS", "all"))
-        raw_points = os.environ.get("SGLANG_K3_CAPTURE_POINTS", "all").strip()
+        plan_operations = plan.get("operations", [])
+        raw_points = (
+            os.environ.get("SGLANG_REPLAY_CAPTURE_POINTS")
+            or (
+                ",".join(f"bundle.{name}" for name in plan_operations)
+                if plan_operations
+                else None
+            )
+            or os.environ.get("SGLANG_K3_CAPTURE_POINTS", "all")
+        ).strip()
+        self.all_points = not raw_points or raw_points.lower() == "all"
         self.points = (
             set(_DEFAULT_POINTS)
-            if not raw_points or raw_points.lower() == "all"
+            if self.all_points
             else {point.strip() for point in raw_points.split(",") if point.strip()}
         )
         rank_filter = os.environ.get("SGLANG_K3_CAPTURE_RANKS", "0").strip().lower()
+        if "collective.tp_residual" in plan_operations and rank_filter != "all":
+            raise ValueError(
+                "collective replay capture requires SGLANG_K3_CAPTURE_RANKS=all"
+            )
         self.rank_allowed = rank_filter == "all" or self.rank in {
             int(item) for item in rank_filter.split(",") if item.strip()
         }
         self._rows: dict[tuple[str, int], int] = {}
+        self._plan_row_limits = {
+            f"bundle.{name}": int(limit)
+            for name, limit in plan.get("max_rows_per_operation", {}).items()
+        }
         self._rows_by_phase: dict[tuple[str, int, str], int] = {}
         self._events: dict[tuple[str, int], int] = {}
         self._calls: dict[tuple[str, int], int] = {}
@@ -234,6 +278,7 @@ class K3TensorCapture:
                 "async_capture": self.async_enabled,
                 "shard_target_bytes": self.shard_target_bytes,
                 "expert_quota": self.expert_quota,
+                "max_bytes": self.max_bytes,
             }
             with self._manifest.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(run_record, sort_keys=True) + "\n")
@@ -299,7 +344,9 @@ class K3TensorCapture:
 
     def _check_async_error(self) -> None:
         if self._async_error is not None:
-            raise RuntimeError("K3 asynchronous capture worker failed") from self._async_error
+            raise RuntimeError(
+                "K3 asynchronous capture worker failed"
+            ) from self._async_error
 
     def _append_manifest(self, path: Path, record: Mapping[str, Any]) -> None:
         with path.open("a", encoding="utf-8") as handle:
@@ -446,10 +493,41 @@ class K3TensorCapture:
         return self.rank_allowed and self.path_wants(point, layer_idx)
 
     def _row_limit(self, point: str, phase: str = "all") -> int:
-        env_name = "SGLANG_K3_CAPTURE_MAX_ROWS_" + point.upper().replace("-", "_")
+        env_name = "SGLANG_K3_CAPTURE_MAX_ROWS_" + point.upper().replace(
+            "-", "_"
+        ).replace(".", "_")
         phase_name = f"{env_name}_{phase.upper()}"
-        value = os.environ.get(phase_name, os.environ.get(env_name, str(self.default_max_rows)))
+        default = self._plan_row_limits.get(point, self.default_max_rows)
+        value = os.environ.get(phase_name, os.environ.get(env_name, str(default)))
         return max(1, int(value))
+
+    def _fit_byte_budget(
+        self,
+        present: Mapping[str, torch.Tensor],
+        row_count: int,
+        take: int,
+        once: bool,
+    ) -> int:
+        """Shrink a row-consistent bundle to the remaining hard byte budget."""
+        fixed = 0
+        per_row = 0
+        for value in present.values():
+            nbytes = value.numel() * value.element_size()
+            if not once and value.ndim > 0 and int(value.shape[0]) == row_count:
+                per_row += nbytes // max(1, row_count)
+            else:
+                fixed += nbytes
+        remaining = self.max_bytes - self._bytes_reserved
+        if fixed > remaining:
+            return 0
+        if per_row == 0:
+            fitted = take
+        else:
+            fitted = min(take, (remaining - fixed) // per_row)
+        if fitted <= 0:
+            return 0
+        self._bytes_reserved += fixed + fitted * per_row
+        return int(fitted)
 
     def remaining_rows(
         self, point: str, layer_idx: int, phase: str | None = None
@@ -460,8 +538,7 @@ class K3TensorCapture:
         key = (point, layer_idx, resolved_phase)
         return max(
             0,
-            self._row_limit(point, resolved_phase)
-            - self._rows_by_phase.get(key, 0),
+            self._row_limit(point, resolved_phase) - self._rows_by_phase.get(key, 0),
         )
 
     def _gpu_sample_indices(
@@ -531,7 +608,9 @@ class K3TensorCapture:
 
         cpu_tensors: dict[str, torch.Tensor] = {}
         tensor_meta: dict[str, Any] = {}
-        current_stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
+        current_stream = (
+            torch.cuda.current_stream(device) if device.type == "cuda" else None
+        )
         copy_event = None
         # Materialize sampled tensors on the model stream.  Selecting on the
         # copy stream would let the model stream immediately reuse or mutate
@@ -590,9 +669,13 @@ class K3TensorCapture:
             "tensors": tensor_meta,
             "metadata": _jsonable(merged_metadata),
         }
-        nbytes = sum(value.numel() * value.element_size() for value in cpu_tensors.values())
+        nbytes = sum(
+            value.numel() * value.element_size() for value in cpu_tensors.values()
+        )
         assert self._pending_queue is not None
-        self._pending_queue.put(_PendingCapture(copy_event, cpu_tensors, record, nbytes))
+        self._pending_queue.put(
+            _PendingCapture(copy_event, cpu_tensors, record, nbytes)
+        )
         return Path(f"queued://rank-{self.rank}/{point}/l{layer_idx}/e{event}")
 
     def capture(
@@ -650,6 +733,10 @@ class K3TensorCapture:
                         take,
                         (row_count + self.world_size - 1) // self.world_size,
                     )
+            if take <= 0:
+                return None
+
+            take = self._fit_byte_budget(present, row_count, take, once)
             if take <= 0:
                 return None
 
@@ -739,32 +826,39 @@ class K3TensorCapture:
             return final_path
 
 
-_CAPTURE: K3TensorCapture | None = None
+# Backward-compatible name for the existing K3 call sites and launch scripts.
+K3TensorCapture = ReplayTensorCapture
 
 
-def get_k3_tensor_capture() -> K3TensorCapture:
+_CAPTURE: ReplayTensorCapture | None = None
+
+
+def get_replay_tensor_capture() -> ReplayTensorCapture:
     global _CAPTURE
     if _CAPTURE is None:
-        _CAPTURE = K3TensorCapture()
+        _CAPTURE = ReplayTensorCapture()
     return _CAPTURE
+
+
+get_k3_tensor_capture = get_replay_tensor_capture
 
 
 def k3_capture_wants(point: str, layer_idx: int) -> bool:
     # This predicate controls graph structure in K3's router.  Every TP rank
     # must choose the same fused/unfused path even when only one rank writes.
-    return get_k3_tensor_capture().path_wants(point, layer_idx)
+    return get_replay_tensor_capture().path_wants(point, layer_idx)
 
 
 def k3_capture_remaining_rows(point: str, layer_idx: int) -> int:
-    return get_k3_tensor_capture().remaining_rows(point, layer_idx)
+    return get_replay_tensor_capture().remaining_rows(point, layer_idx)
 
 
 def k3_capture_set_forward_context(forward_batch: Any) -> None:
-    get_k3_tensor_capture().set_forward_context(forward_batch)
+    get_replay_tensor_capture().set_forward_context(forward_batch)
 
 
 def k3_capture_close() -> None:
-    get_k3_tensor_capture().close()
+    get_replay_tensor_capture().close()
 
 
 def k3_capture(
@@ -775,6 +869,6 @@ def k3_capture(
     metadata: Mapping[str, Any] | None = None,
     once: bool = False,
 ) -> Path | None:
-    return get_k3_tensor_capture().capture(
+    return get_replay_tensor_capture().capture(
         point, layer_idx, tensors, metadata=metadata, once=once
     )

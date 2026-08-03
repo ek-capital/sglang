@@ -19,10 +19,14 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
-
 from sglang.srt.debug_utils.k3_tensor_capture import k3_capture
+from sglang.srt.debug_utils.replay_capture import (
+    replay_capture_bundle,
+    replay_capture_wants,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.observability.hotloop_profile import semantic_range
 
 _BLOCK_H: int = 1024  # H = 7168 = 7 x 1024
 _MAX_ROWS: int = 16  # next_pow2(8 + 1), K3 has <= 8 snapshots
@@ -430,33 +434,42 @@ class AttnResidual:
         block_residual = (
             self.block_residual if rows is None else self.block_residual[rows]
         )
+        capture_replay = replay_capture_wants(
+            "residual.attnres", self.capture_layer_idx
+        )
+        replay_bank_before = (
+            block_residual[:, :nvb].clone() if capture_replay else None
+        )
 
         fused_write = write and _use_fast(hidden_states.shape[1])
-        if prefix_sum is None:
-            # hidden_states already is the whole head (PP entry or a
-            # block-boundary restart).
-            normed = _aggregate(
-                hidden_states,
-                block_residual,
-                nvb,
-                score_proj,
-                score_norm,
-                out_norm,
-                write_bank_row=fused_write,
-            )
-            prefix = hidden_states
-        else:
-            # Pending add: materialize the prefix, then aggregate.
-            normed, prefix = _aggregate_fused_add(
-                prefix_sum,
-                hidden_states,
-                block_residual,
-                nvb,
-                score_proj,
-                score_norm,
-                out_norm,
-                write_bank_row=fused_write,
-            )
+        with semantic_range(
+            "residual.attnres", layer=self.capture_layer_idx, valid_blocks=nvb
+        ):
+            if prefix_sum is None:
+                # hidden_states already is the whole head (PP entry or a
+                # block-boundary restart).
+                normed = _aggregate(
+                    hidden_states,
+                    block_residual,
+                    nvb,
+                    score_proj,
+                    score_norm,
+                    out_norm,
+                    write_bank_row=fused_write,
+                )
+                prefix = hidden_states
+            else:
+                # Pending add: materialize the prefix, then aggregate.
+                normed, prefix = _aggregate_fused_add(
+                    prefix_sum,
+                    hidden_states,
+                    block_residual,
+                    nvb,
+                    score_proj,
+                    score_norm,
+                    out_norm,
+                    write_bank_row=fused_write,
+                )
         if fused_write:
             self.num_valid_blocks += 1  # row nvb written in-kernel
         elif write:
@@ -474,6 +487,56 @@ class AttnResidual:
             mode="forward",
             write=write,
         )
+        if capture_replay:
+            assert replay_bank_before is not None
+            score_rows = torch.cat(
+                [replay_bank_before, prefix.unsqueeze(1)], dim=1
+            )
+            token_count, row_count, hidden_size = score_rows.shape
+            score_input = score_norm(
+                score_rows.reshape(token_count * row_count, hidden_size)
+            )
+            aggregation_scores = score_proj(score_input)[0].reshape(
+                token_count, row_count
+            )
+            softmax_weights = torch.softmax(aggregation_scores.float(), dim=-1)
+            replay_capture_bundle(
+                "residual.attnres",
+                self.capture_layer_idx,
+                {
+                    "hidden_states": hidden_states,
+                    "pending_prefix": (
+                        prefix_sum
+                        if prefix_sum is not None
+                        else torch.zeros_like(hidden_states)
+                    ),
+                    "residual_bank_before": replay_bank_before,
+                    "valid_block_count": torch.full(
+                        (token_count,),
+                        nvb,
+                        dtype=torch.int32,
+                        device=hidden_states.device,
+                    ),
+                    "aggregation_scores": aggregation_scores,
+                    "softmax_weights": softmax_weights,
+                    "aggregated_prefix": prefix,
+                    "normalized_output": normed,
+                    "residual_bank_after": block_residual[
+                        :, : self.num_valid_blocks
+                    ],
+                    "write_index": torch.full(
+                        (token_count,),
+                        nvb if write else -1,
+                        dtype=torch.int32,
+                        device=hidden_states.device,
+                    ),
+                },
+                metadata={
+                    "pending_prefix_present": prefix_sum is not None,
+                    "write": write,
+                    "num_valid_blocks_after": self.num_valid_blocks,
+                },
+            )
         return normed, prefix
 
     def _capture(

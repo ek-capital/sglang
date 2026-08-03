@@ -5,6 +5,7 @@ from enum import IntEnum
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 from safetensors.torch import load_file
 
@@ -71,6 +72,48 @@ def test_k3_tensor_capture_disabled_by_default(monkeypatch):
     capture = K3TensorCapture()
     assert not capture.enabled
     assert capture.capture("routing", 0, {"x": torch.ones(1)}) is None
+
+
+def test_capture_honors_hard_byte_budget(tmp_path, monkeypatch):
+    monkeypatch.setenv("SGLANG_REPLAY_CAPTURE_DIR", str(tmp_path))
+    monkeypatch.setenv("SGLANG_REPLAY_CAPTURE_MAX_GIB", "0.00000001")
+    monkeypatch.setenv("SGLANG_REPLAY_CAPTURE_POINTS", "bundle.test")
+    capture = K3TensorCapture()
+    # The bundle is shrunk with row-consistent sampling rather than exceeding
+    # the hard ceiling.
+    path = capture.capture(
+        "bundle.test", 0, {"value": torch.zeros(1024, dtype=torch.float32)}
+    )
+    assert path is not None
+    assert load_file(path)["value"].shape[0] < 1024
+    record = json.loads(
+        (tmp_path / "rank-00000/manifest.jsonl").read_text().splitlines()[-1]
+    )
+    assert record["rows"] < 1024
+
+
+def test_capture_rejects_simultaneous_profiling(tmp_path, monkeypatch):
+    monkeypatch.setenv("SGLANG_REPLAY_CAPTURE_DIR", str(tmp_path))
+    monkeypatch.setenv("SGLANG_HOTLOOP_PROFILE", "1")
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        K3TensorCapture()
+
+
+def test_collective_plan_requires_all_ranks(tmp_path, monkeypatch):
+    plan = tmp_path / "plan.json"
+    plan.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "operations": ["collective.tp_residual"],
+            }
+        )
+    )
+    monkeypatch.setenv("SGLANG_REPLAY_CAPTURE_DIR", str(tmp_path / "capture"))
+    monkeypatch.setenv("SGLANG_REPLAY_CAPTURE_PLAN", str(plan))
+    monkeypatch.setenv("SGLANG_K3_CAPTURE_RANKS", "0")
+    with pytest.raises(ValueError, match="RANKS=all"):
+        K3TensorCapture()
 
 
 def test_k3_tensor_capture_waits_for_arm_file(tmp_path, monkeypatch):
@@ -230,9 +273,13 @@ def test_expert_quota_sampling_records_assignment_coverage(tmp_path, monkeypatch
 
     records = [
         json.loads(line)
-        for line in (tmp_path / "rank-00000" / "manifest.jsonl").read_text().splitlines()
+        for line in (tmp_path / "rank-00000" / "manifest.jsonl")
+        .read_text()
+        .splitlines()
     ]
-    quota = next(record for record in records if record["record_type"] == "expert_quota")
+    quota = next(
+        record for record in records if record["record_type"] == "expert_quota"
+    )
     assert quota["experts_at_quota"] == 4
     assert quota["min_assignments"] == 2
 
@@ -263,7 +310,9 @@ def test_single_row_decode_calls_are_round_robined_across_ranks(tmp_path, monkey
 
     records = [
         json.loads(line)
-        for line in (tmp_path / "rank-00001" / "manifest.jsonl").read_text().splitlines()
+        for line in (tmp_path / "rank-00001" / "manifest.jsonl")
+        .read_text()
+        .splitlines()
     ]
     entries = [
         entry

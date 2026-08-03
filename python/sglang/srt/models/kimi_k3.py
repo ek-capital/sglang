@@ -12,8 +12,6 @@ from functools import cached_property
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
-from torch import nn
-
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.srt.configs.kimi_k3 import KimiK3Config
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
@@ -21,6 +19,11 @@ from sglang.srt.debug_utils.k3_tensor_capture import (
     k3_capture,
     k3_capture_set_forward_context,
     k3_capture_wants,
+)
+from sglang.srt.debug_utils.replay_capture import (
+    replay_capture_bundle,
+    replay_capture_path_wants,
+    replay_capture_wants,
 )
 from sglang.srt.distributed import (
     divide,
@@ -111,6 +114,7 @@ from sglang.srt.models.kimi_k3_vl import (
 from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
+from sglang.srt.observability.hotloop_profile import semantic_range
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import is_blackwell_supported, is_hip, make_layers
 from sglang.srt.utils.common import (
@@ -121,6 +125,7 @@ from sglang.srt.utils.common import (
     require_mlp_sync,
     set_weight_attrs,
 )
+from torch import nn
 
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
@@ -710,7 +715,6 @@ class KimiK3MoE(nn.Module):
         backend (combine returns fully-summed rows; `_reduce_latent` then only
         applies the norm)."""
         import deep_gemm
-
         from sglang.kernels.ops.attention.dsv4 import mega_moe_pre_dispatch
         from sglang.srt.distributed.parallel_state import get_moe_ep_group
         from sglang.srt.environ import envs
@@ -1061,8 +1065,36 @@ class KimiK3MoE(nn.Module):
             # ones need the partial-sum reduction.
             if self.tp_size > 1 and not self._shared_experts_tp1:
                 shared_output = tensor_model_parallel_all_reduce(shared_output)
-            return _add3(out, shared_output, prefix_sum)
-        return out if prefix_sum is None else out + prefix_sum
+            tail_output = _add3(out, shared_output, prefix_sum)
+            if replay_capture_wants("moe.shared_mlp", self.layer_idx):
+                replay_capture_bundle(
+                    "moe.shared_mlp",
+                    self.layer_idx,
+                    {
+                        "hidden_states": hidden_states,
+                        "shared_output": shared_output,
+                    },
+                )
+            if replay_capture_wants("moe.tail", self.layer_idx):
+                replay_capture_bundle(
+                    "moe.tail",
+                    self.layer_idx,
+                    {
+                        "routed_output": out,
+                        "shared_output": shared_output,
+                        "pending_residual": (
+                            prefix_sum
+                            if prefix_sum is not None
+                            else torch.zeros_like(out)
+                        ),
+                        "tail_output": tail_output,
+                        "latent_before_up_proj": latent,
+                    },
+                    metadata={"pending_residual_present": prefix_sum is not None},
+                )
+            return tail_output
+        tail_output = out if prefix_sum is None else out + prefix_sum
+        return tail_output
 
     @cached_property
     def _route_quant_fuse_eligible(self) -> bool:
@@ -1284,14 +1316,19 @@ class KimiK3MoE(nn.Module):
             hidden_states = get_global_dp_buffer(get_tp_group())
             dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
             dp_prefix_sum, prefix_sum = prefix_sum, None
-        if (
-            hidden_states.shape[0] > 0
-            and self._eligible_for_fused_front
-            and not k3_capture_wants("routing", self.layer_idx)
-        ):
-            out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
-        else:
-            out = self._forward_unfused(hidden_states, prefix_sum=prefix_sum)
+        with semantic_range("moe.layer", layer=self.layer_idx):
+            if (
+                hidden_states.shape[0] > 0
+                and self._eligible_for_fused_front
+                and not k3_capture_wants("routing", self.layer_idx)
+                and not replay_capture_path_wants(
+                    "moe.shared_mlp", self.layer_idx
+                )
+                and not replay_capture_path_wants("moe.tail", self.layer_idx)
+            ):
+                out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
+            else:
+                out = self._forward_unfused(hidden_states, prefix_sum=prefix_sum)
         if use_dp:
             global_out = out
             out = get_local_dp_buffer(_dp_local_buffer_group())
@@ -2312,12 +2349,22 @@ class KimiK3DecoderLayer(nn.Module):
                 "forward_mode": str(forward_batch.forward_mode),
             },
         )
-        result = self.self_attn(
-            hidden_states=hidden_states,
-            positions=positions,
-            forward_batch=forward_batch,
-            zero_allocator=zero_allocator,
+        attention_kind = (
+            "attention.mla"
+            if qkv_latent_func is not None
+            else "attention.kda"
         )
+        with semantic_range(
+            attention_kind,
+            layer=self.layer_idx,
+            phase=getattr(forward_batch.forward_mode, "name", "unknown"),
+        ):
+            result = self.self_attn(
+                hidden_states=hidden_states,
+                positions=positions,
+                forward_batch=forward_batch,
+                zero_allocator=zero_allocator,
+            )
 
         if qkv_latent_func is not None:
             get_attn_tp_context().clear_attn_inputs()

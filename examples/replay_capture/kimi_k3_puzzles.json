@@ -1,0 +1,19 @@
+{
+  "format_version": 1,
+  "model_family": "kimi_k3",
+  "max_gib_per_rank": 4,
+  "operations": [
+    "speculative.draft_round",
+    "moe.shared_mlp",
+    "moe.tail",
+    "residual.attnres",
+    "collective.tp_residual"
+  ],
+  "max_rows_per_operation": {
+    "speculative.draft_round": 128,
+    "moe.shared_mlp": 256,
+    "moe.tail": 256,
+    "residual.attnres": 256,
+    "collective.tp_residual": 256
+  }
+}
