@@ -13,6 +13,7 @@ from sglang.srt.speculative.dspark_components.dspark_observability import (
     DecodeStepObservation,
     DsparkInfoDumper,
     InfoComponent,
+    InfoSegment,
     _PendingStep,
     logger,
     resolve_components,
@@ -180,6 +181,15 @@ class TestCoreAndCpuTiming(CustomTestCase):
         dumper.observe_decode_step(make_obs(forward_ct=2))
         for record in dumper.dump()["records"]:
             self.assertNotIn("step_cpu_ms", record)
+
+    def test_phase_component_enables_complete_decode_timing_taxonomy(self):
+        dumper, _ = make_dumper({"phase_gpu_times"})
+        self.assertTrue(dumper._timing_component_enabled(InfoSegment.STEP))
+        self.assertTrue(dumper._timing_component_enabled(InfoSegment.DRAFT))
+        self.assertTrue(dumper._timing_component_enabled(InfoSegment.TARGET_VERIFY))
+        self.assertTrue(dumper._timing_component_enabled(InfoSegment.PREPARE_WINDOW))
+        self.assertTrue(dumper._timing_component_enabled(InfoSegment.ACCEPT_FINALIZE))
+        self.assertTrue(dumper._timing_component_enabled(InfoSegment.STATE_COMMIT))
 
     def test_non_decode_step_resets_cpu_pairing(self):
         dumper, clock = make_dumper({"core", "step_cpu_time"})

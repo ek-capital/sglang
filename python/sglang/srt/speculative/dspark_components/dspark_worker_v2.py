@@ -18,7 +18,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     compute_position,
 )
-from sglang.srt.observability.hotloop_profile import semantic_range
+from sglang.srt.observability.hotloop_profile import (
+    architecture_scope,
+    semantic_range,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -537,7 +540,11 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         target_model = self.target_worker.model_runner.model
 
-        with semantic_range("speculative.prepare_window", batch_size=bs):
+        with architecture_scope(
+            phase="prepare", model_role="runtime"
+        ), self._observers.segment(InfoSegment.PREPARE_WINDOW), semantic_range(
+            "speculative.prepare_window", batch_size=bs
+        ):
             verify_window = alloc_verify_window(
                 batch=batch,
                 bs=bs,
@@ -548,9 +555,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
 
         sampling_info = batch.sampling_info
-        with self._draft_context(), self._observers.segment(
-            InfoSegment.DRAFT
-        ), semantic_range("speculative.draft"):
+        with self._draft_context(), architecture_scope(
+            phase="draft", model_role="draft"
+        ), self._observers.segment(InfoSegment.DRAFT), semantic_range(
+            "speculative.draft"
+        ):
             proposal = self._proposer.propose(
                 batch=batch,
                 draft_input=draft_input,
@@ -565,7 +574,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         draft_tokens = draft_block.draft_tokens
         proposal_confidence_present = proposal.confidence is not None
 
-        with semantic_range("speculative.confidence_budget", batch_size=bs):
+        with architecture_scope(
+            phase="plan", model_role="runtime"
+        ), self._observers.segment(InfoSegment.CONFIDENCE_BUDGET), semantic_range(
+            "speculative.confidence_budget", batch_size=bs
+        ):
             confidence = proposal.confidence
             if confidence is None:
                 confidence = self._verify_planner.compute_confidence_tensor(
@@ -589,7 +602,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             and batch.global_num_tokens is not None
             else None
         )
-        with semantic_range("speculative.schedule_layout", batch_size=bs):
+        with architecture_scope(
+            phase="plan", model_role="runtime"
+        ), self._observers.segment(InfoSegment.SCHEDULE_LAYOUT), semantic_range(
+            "speculative.schedule_layout", batch_size=bs
+        ):
             layout = self._verify_planner.schedule_layout(
                 req_pool_indices=batch.req_pool_indices,
                 prefix_lens=prefix_lens,
@@ -624,7 +641,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             and not batch.has_grammar
         )
         prepare_mamba_track_for_verify(batch)
-        with self._observers.segment(InfoSegment.TARGET_VERIFY), semantic_range(
+        with architecture_scope(
+            phase="target_verify", model_role="target"
+        ), self._observers.segment(InfoSegment.TARGET_VERIFY), semantic_range(
             "speculative.target_verify"
         ):
             if run_compact:
@@ -665,7 +684,9 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         epilogue = self._verify_executor.verify_epilogue
         folded_accept = fold_eligible and run_compact and can_run_cuda_graph
-        with semantic_range(
+        with architecture_scope(
+            phase="accept", model_role="runtime"
+        ), self._observers.segment(InfoSegment.ACCEPT_FINALIZE), semantic_range(
             "speculative.accept_finalize", batch_size=bs, folded=folded_accept
         ):
             accept = self._verify_executor.accept_and_finalize(
@@ -686,27 +707,30 @@ class DSparkWorkerV2(BaseSpecWorker):
             else:
                 on_publish(accept.new_seq_lens)
 
-        with semantic_range("speculative.kda_commit", batch_size=bs):
-            self._commit_target_mamba_states_after_verify(
-                batch=batch,
-                seq_lens_pre_verify=prefix_lens,
-                seq_lens_post_verify=accept.new_seq_lens,
-                commit_lens=accept.commit_lens,
-            )
-
-        folded_commit = folded_accept and epilogue.folds_commit
-        if not folded_commit:
-            with semantic_range("speculative.hidden_commit", batch_size=bs):
-                self._verify_executor.commit_hidden(
+        with architecture_scope(
+            phase="state_commit", model_role="runtime"
+        ), self._observers.segment(InfoSegment.STATE_COMMIT):
+            with semantic_range("speculative.kda_commit", batch_size=bs):
+                self._commit_target_mamba_states_after_verify(
                     batch=batch,
-                    layout=layout,
-                    hidden_strided=hidden_strided,
-                    verify_window=verify_window,
-                    logits_output=logits_output,
+                    seq_lens_pre_verify=prefix_lens,
+                    seq_lens_post_verify=accept.new_seq_lens,
                     commit_lens=accept.commit_lens,
-                    bs=bs,
-                    run_compact=run_compact,
                 )
+
+            folded_commit = folded_accept and epilogue.folds_commit
+            if not folded_commit:
+                with semantic_range("speculative.hidden_commit", batch_size=bs):
+                    self._verify_executor.commit_hidden(
+                        batch=batch,
+                        layout=layout,
+                        hidden_strided=hidden_strided,
+                        verify_window=verify_window,
+                        logits_output=logits_output,
+                        commit_lens=accept.commit_lens,
+                        bs=bs,
+                        run_compact=run_compact,
+                    )
         logits_output.hidden_states = None
 
         self._observers.observe_verify_step(

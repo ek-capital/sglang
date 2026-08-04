@@ -38,13 +38,19 @@ class InfoComponent(str, Enum):
     STEP_GPU_TIME = "step_gpu_time"
     DRAFT_GPU_TIME = "draft_gpu_time"
     TARGET_VERIFY_GPU_TIME = "target_verify_gpu_time"
+    PHASE_GPU_TIMES = "phase_gpu_times"
     REQS = "reqs"
 
 
 class InfoSegment(str, Enum):
     STEP = "step"
+    PREPARE_WINDOW = "prepare_window"
     DRAFT = "draft"
+    CONFIDENCE_BUDGET = "confidence_budget"
+    SCHEDULE_LAYOUT = "schedule_layout"
     TARGET_VERIFY = "target_verify"
+    ACCEPT_FINALIZE = "accept_finalize"
+    STATE_COMMIT = "state_commit"
 
 
 INFO_DUMP_MAX_RECORDS = 200_000
@@ -108,6 +114,11 @@ class DecodeStepRecord(msgspec.Struct, omit_defaults=True):
     step_gpu_ms: Optional[float] = None
     draft_gpu_ms: Optional[float] = None
     target_verify_gpu_ms: Optional[float] = None
+    prepare_window_gpu_ms: Optional[float] = None
+    confidence_budget_gpu_ms: Optional[float] = None
+    schedule_layout_gpu_ms: Optional[float] = None
+    accept_finalize_gpu_ms: Optional[float] = None
+    state_commit_gpu_ms: Optional[float] = None
     reqs: Optional[list[ReqDetail]] = None
 
 
@@ -207,7 +218,7 @@ class DsparkInfoDumper:
             return
         self._current_segments = {}
         self._open_segments = {}
-        if InfoComponent.STEP_GPU_TIME in self._components:
+        if self._timing_component_enabled(InfoSegment.STEP):
             self._open_segment(InfoSegment.STEP)
 
     def segment(self, name: Union[InfoSegment, str]) -> ContextManager[None]:
@@ -229,7 +240,7 @@ class DsparkInfoDumper:
     def observe_decode_step(self, obs: DecodeStepObservation) -> None:
         if not self.enabled:
             return
-        if InfoComponent.STEP_GPU_TIME in self._components:
+        if self._timing_component_enabled(InfoSegment.STEP):
             self._close_segment(InfoSegment.STEP)
 
         now = self._clock()
@@ -294,6 +305,11 @@ class DsparkInfoDumper:
         }
 
     def _segment_enabled(self, segment: InfoSegment) -> bool:
+        return self._timing_component_enabled(segment)
+
+    def _timing_component_enabled(self, segment: InfoSegment) -> bool:
+        if InfoComponent.PHASE_GPU_TIMES in self._components:
+            return True
         if segment is InfoSegment.STEP:
             return InfoComponent.STEP_GPU_TIME in self._components
         if segment is InfoSegment.DRAFT:
@@ -352,13 +368,29 @@ class DsparkInfoDumper:
             record.predicted_theta = pending.predicted_theta
         if InfoComponent.STEP_CPU_TIME in self._components:
             record.step_cpu_ms = pending.step_cpu_ms
-        if InfoComponent.STEP_GPU_TIME in self._components:
+        if self._timing_component_enabled(InfoSegment.STEP):
             record.step_gpu_ms = self._segment_ms(pending, InfoSegment.STEP)
-        if InfoComponent.DRAFT_GPU_TIME in self._components:
+        if self._timing_component_enabled(InfoSegment.DRAFT):
             record.draft_gpu_ms = self._segment_ms(pending, InfoSegment.DRAFT)
-        if InfoComponent.TARGET_VERIFY_GPU_TIME in self._components:
+        if self._timing_component_enabled(InfoSegment.TARGET_VERIFY):
             record.target_verify_gpu_ms = self._segment_ms(
                 pending, InfoSegment.TARGET_VERIFY
+            )
+        if InfoComponent.PHASE_GPU_TIMES in self._components:
+            record.prepare_window_gpu_ms = self._segment_ms(
+                pending, InfoSegment.PREPARE_WINDOW
+            )
+            record.confidence_budget_gpu_ms = self._segment_ms(
+                pending, InfoSegment.CONFIDENCE_BUDGET
+            )
+            record.schedule_layout_gpu_ms = self._segment_ms(
+                pending, InfoSegment.SCHEDULE_LAYOUT
+            )
+            record.accept_finalize_gpu_ms = self._segment_ms(
+                pending, InfoSegment.ACCEPT_FINALIZE
+            )
+            record.state_commit_gpu_ms = self._segment_ms(
+                pending, InfoSegment.STATE_COMMIT
             )
         if InfoComponent.REQS in self._components and pending.future is not None:
             record.reqs = self._build_reqs(
