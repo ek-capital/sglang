@@ -33,6 +33,15 @@ class SectionTiming:
     capture_ready: bool
 
 
+@dataclass(frozen=True)
+class ArchitectureTiming:
+    path: str
+    time_ms: float
+    share: float
+    calls: int
+    attribution: str
+
+
 def _load_json(path: Path) -> dict[str, Any]:
     opener = gzip.open if path.suffix == ".gz" else open
     with opener(path, "rt", encoding="utf-8") as handle:
@@ -94,6 +103,86 @@ def _semantic_section(name: str) -> str | None:
     return semantic if semantic in REGISTRY.capabilities() else None
 
 
+def _semantic_architecture(name: str) -> str | None:
+    prefix = "sglang.hotloop/"
+    if not name.startswith(prefix):
+        return None
+    body = name[len(prefix) :]
+    semantic, _, raw_dimensions = body.partition("/")
+    dimensions: dict[str, str] = {}
+    for item in raw_dimensions.split(",") if raw_dimensions else ():
+        key, separator, value = item.partition("=")
+        if separator:
+            dimensions[key] = value
+    components = [
+        dimensions.get("phase"),
+        dimensions.get("model_role"),
+        dimensions.get("block_type"),
+        semantic,
+    ]
+    return ".".join(component for component in components if component)
+
+
+def _external_id(event: dict[str, Any]) -> int | None:
+    args = event.get("args") or {}
+    for key in ("External id", "external_id", "External ID"):
+        if args.get(key) is not None:
+            return int(args[key])
+    return None
+
+
+def _semantic_external_ids(events: list[dict[str, Any]]) -> dict[int, str]:
+    """Map CPU launch correlation IDs to their deepest semantic range.
+
+    Torch traces associate CUDA kernels with the external ID of the CPU launch
+    operation, not directly with the enclosing ``record_function``.  A
+    per-thread interval sweep recovers that parent without relying on kernel
+    names. CUDA-graph node mapping is still required for fine leaves inside a
+    monolithic graph replay; those launches inherit the graph's outer scope.
+    """
+
+    ranges_by_thread: defaultdict[tuple[int, int], list[tuple[float, float, str]]]
+    ranges_by_thread = defaultdict(list)
+    launches_by_thread: defaultdict[tuple[int, int], list[tuple[float, float, int]]] = (
+        defaultdict(list)
+    )
+    for event in events:
+        if _is_kernel(event):
+            continue
+        start = float(event.get("ts", 0.0))
+        duration = _duration_us(event)
+        if duration <= 0:
+            continue
+        thread = (int(event.get("pid", 0)), int(event.get("tid", 0)))
+        architecture = _semantic_architecture(str(event.get("name", "")))
+        if architecture:
+            ranges_by_thread[thread].append((start, start + duration, architecture))
+        external_id = _external_id(event)
+        if external_id is not None:
+            launches_by_thread[thread].append((start, start + duration, external_id))
+
+    ownership: dict[int, str] = {}
+    for thread, launches in launches_by_thread.items():
+        ranges = sorted(ranges_by_thread.get(thread, ()))
+        if not ranges:
+            continue
+        active: list[tuple[float, float, str]] = []
+        range_index = 0
+        for launch_start, launch_end, external_id in sorted(launches):
+            while range_index < len(ranges) and ranges[range_index][0] <= launch_start:
+                active.append(ranges[range_index])
+                range_index += 1
+            active = [item for item in active if item[1] >= launch_end]
+            owner = min(
+                active,
+                key=lambda item: item[1] - item[0],
+                default=None,
+            )
+            if owner is not None:
+                ownership[external_id] = owner[2]
+    return ownership
+
+
 def _step_count(payload: dict[str, Any]) -> int:
     explicit = payload.get("decode_steps")
     if explicit is not None:
@@ -114,7 +203,10 @@ def _events(payload: dict[str, Any]) -> Iterable[dict[str, Any]]:
                 "name": event["name"],
                 "dur": event["duration_us"],
                 "cat": "kernel",
-                "args": {"section": event.get("section")},
+                "args": {
+                    "section": event.get("section"),
+                    "architecture_path": event.get("architecture_path"),
+                },
             }
         return
     yield from payload.get("traceEvents", [])
@@ -126,15 +218,21 @@ def analyze_traces(
     per_rank_us: defaultdict[int, Counter[str]] = defaultdict(Counter)
     per_rank_calls: defaultdict[int, Counter[str]] = defaultdict(Counter)
     per_rank_steps: Counter[int] = Counter()
+    per_rank_arch_us: defaultdict[int, Counter[str]] = defaultdict(Counter)
+    per_rank_arch_calls: defaultdict[int, Counter[str]] = defaultdict(Counter)
+    per_rank_arch_sources: defaultdict[int, defaultdict[str, Counter[str]]]
+    per_rank_arch_sources = defaultdict(lambda: defaultdict(Counter))
     evidence: Counter[str] = Counter()
 
     for path in paths:
         payload = _load_json(path)
         rank = _rank(path, payload)
         per_rank_steps[rank] += _step_count(payload)
+        events = list(_events(payload))
+        external_owners = _semantic_external_ids(events)
         kernels_seen = 0
-        projected: list[tuple[str, float]] = []
-        for event in _events(payload):
+        projected: list[tuple[str, str, float]] = []
+        for event in events:
             name = str(event.get("name", ""))
             duration = _duration_us(event)
             if duration <= 0:
@@ -150,19 +248,42 @@ def analyze_traces(
                 )
                 per_rank_us[rank][section] += duration
                 per_rank_calls[rank][section] += 1
+                architecture = args.get("architecture_path")
+                source = "explicit"
+                if not architecture:
+                    external_id = _external_id(event)
+                    architecture = (
+                        external_owners.get(external_id)
+                        if external_id is not None
+                        else None
+                    )
+                    source = "semantic_correlation"
+                if not architecture:
+                    architecture = section
+                    source = "kernel_name_fallback"
+                architecture = str(architecture)
+                per_rank_arch_us[rank][architecture] += duration
+                per_rank_arch_calls[rank][architecture] += 1
+                per_rank_arch_sources[rank][architecture][source] += duration
                 evidence["exclusive_kernel"] += 1
                 continue
             semantic = _semantic_section(name)
+            architecture = _semantic_architecture(name)
             args = event.get("args") or {}
-            if semantic and args.get("gpu_projected") is True:
-                projected.append((semantic, duration))
+            if semantic and architecture and args.get("gpu_projected") is True:
+                projected.append((semantic, architecture, duration))
         if kernels_seen == 0:
             # Fallback for an Nsight exporter that provides projected NVTX GPU
             # durations but no individual kernels. Such ranges may overlap and
             # are marked explicitly in the report.
-            for section, duration in projected:
+            for section, architecture, duration in projected:
                 per_rank_us[rank][section] += duration
                 per_rank_calls[rank][section] += 1
+                per_rank_arch_us[rank][architecture] += duration
+                per_rank_arch_calls[rank][architecture] += 1
+                per_rank_arch_sources[rank][architecture][
+                    "projected_semantic"
+                ] += duration
                 evidence["projected_semantic_fallback"] += 1
 
     if not per_rank_us:
@@ -190,6 +311,21 @@ def analyze_traces(
                 capture_ready=capture_ready,
             )
         )
+    architecture_rows: list[ArchitectureTiming] = []
+    semantically_attributed_us = 0.0
+    for path, duration in per_rank_arch_us[critical_rank].most_common():
+        sources = per_rank_arch_sources[critical_rank][path]
+        attribution = sources.most_common(1)[0][0]
+        semantically_attributed_us += duration - sources["kernel_name_fallback"]
+        architecture_rows.append(
+            ArchitectureTiming(
+                path=path,
+                time_ms=duration / 1000.0 / steps,
+                share=duration / total_us if total_us else 0.0,
+                calls=per_rank_arch_calls[critical_rank][path],
+                attribution=attribution,
+            )
+        )
     return {
         "schema_version": 1,
         "model_family": model_family,
@@ -202,6 +338,10 @@ def analyze_traces(
             else "projected_semantic_fallback_may_overlap"
         ),
         "sections": [asdict(row) for row in rows],
+        "architecture_attribution_coverage": (
+            semantically_attributed_us / total_us if total_us else 0.0
+        ),
+        "architecture_sections": [asdict(row) for row in architecture_rows],
         "rank_totals_ms": {
             str(rank): duration / 1000.0 / max(1, per_rank_steps[rank])
             for rank, duration in sorted(rank_totals.items())
@@ -243,6 +383,26 @@ def _markdown(report: dict[str, Any]) -> str:
     lines.append(
         f"| **Total attributed kernel time** | "
         f"**{report['total_attributed_ms_per_step']:.3f} ms** | **100%** | | |"
+    )
+    lines.extend(
+        (
+            "",
+            "| Architecture path | GPU work/step | Share | Calls | Attribution |",
+            "|---|---:|---:|---:|---|",
+        )
+    )
+    for row in report["architecture_sections"]:
+        lines.append(
+            f"| {row['path']} | {row['time_ms']:.3f} ms | "
+            f"{100 * row['share']:.1f}% | {row['calls']} | "
+            f"{row['attribution']} |"
+        )
+    lines.extend(
+        (
+            "",
+            f"Semantic architecture coverage: "
+            f"{100 * report['architecture_attribution_coverage']:.1f}%.",
+        )
     )
     return "\n".join(lines) + "\n"
 

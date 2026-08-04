@@ -62,6 +62,102 @@ class TestProfileGuidedCapture(unittest.TestCase):
                 ["speculative.draft", "moe.routed_experts", "attention.kda"],
             )
 
+    def test_report_preserves_explicit_architecture_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trace = Path(tmp) / "rank0.json"
+            trace.write_text(
+                json.dumps(
+                    {
+                        "rank": 0,
+                        "decode_steps": 2,
+                        "kernel_events": [
+                            {
+                                "name": "nccl_allreduce",
+                                "duration_us": 2000,
+                                "architecture_path": (
+                                    "target_verify.target.attention.kda."
+                                    "output_projection.tp_allreduce"
+                                ),
+                            },
+                            {
+                                "name": "flashinfer_moe_gemm",
+                                "duration_us": 1000,
+                                "architecture_path": (
+                                    "target_verify.target.moe.experts.w13"
+                                ),
+                            },
+                        ],
+                    }
+                )
+            )
+            report = analyze_traces((trace,), model_family="kimi_k3")
+            architecture = {row["path"]: row for row in report["architecture_sections"]}
+            self.assertAlmostEqual(report["architecture_attribution_coverage"], 1)
+            self.assertAlmostEqual(
+                architecture[
+                    "target_verify.target.attention.kda."
+                    "output_projection.tp_allreduce"
+                ]["time_ms"],
+                1.0,
+            )
+            self.assertEqual(
+                architecture["target_verify.target.moe.experts.w13"]["attribution"],
+                "explicit",
+            )
+
+    def test_report_joins_kernel_external_id_to_semantic_parent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trace = Path(tmp) / "rank0.json"
+            trace.write_text(
+                json.dumps(
+                    {
+                        "rank": 0,
+                        "decode_steps": 1,
+                        "traceEvents": [
+                            {
+                                "name": (
+                                    "sglang.hotloop/attention.kda.recurrence/"
+                                    "model_role=target,phase=target_verify"
+                                ),
+                                "cat": "cpu_op",
+                                "pid": 10,
+                                "tid": 20,
+                                "ts": 0,
+                                "dur": 100,
+                                "args": {},
+                            },
+                            {
+                                "name": "launch recurrent kernel",
+                                "cat": "cpu_op",
+                                "pid": 10,
+                                "tid": 20,
+                                "ts": 10,
+                                "dur": 5,
+                                "args": {"External id": 7},
+                            },
+                            {
+                                "name": "fused_recurrent_kernel",
+                                "cat": "kernel",
+                                "pid": 0,
+                                "tid": 1,
+                                "ts": 200,
+                                "dur": 250,
+                                "args": {"External id": 7},
+                            },
+                        ],
+                    }
+                )
+            )
+            report = analyze_traces((trace,), model_family="kimi_k3")
+            self.assertEqual(
+                report["architecture_sections"][0]["path"],
+                "target_verify.target.attention.kda.recurrence",
+            )
+            self.assertEqual(
+                report["architecture_sections"][0]["attribution"],
+                "semantic_correlation",
+            )
+
     def test_plan_is_bounded_and_rank_complete(self):
         selection = {
             "model_family": "kimi_k3",
